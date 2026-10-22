@@ -1,0 +1,20 @@
+﻿# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*.tmp
+*.log
+*.log.*
+/log/
+/logs/
+
+# Local runtime state and client-specific addresses
+/server.log
+/client_viewports.json
+
+# Machine-specific RDP certificate and private key
+/rdp.crt
+/rdp.key
+
+# Saved RDP profiles can include hostnames, usernames, and credentials
+*.rdp
+*.rdp.bak

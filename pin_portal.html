@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>RDPOTP</title>
+  <link rel="icon" type="image/png" href="rdpotp-icon.png">
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, "Segoe UI", system-ui, sans-serif;
+      background: #080b13;
+      color: #f5f7ff;
+      font-synthesis: none;
+      text-rendering: optimizeLegibility;
+      -webkit-font-smoothing: antialiased;
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      min-height: 100dvh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: clamp(18px, 4vw, 32px);
+      background:
+        radial-gradient(ellipse at 50% 14%, #203866 0, #101b30 35%, transparent 68%),
+        radial-gradient(ellipse at 90% 95%, #15223a 0, transparent 42%),
+        #080b13;
+    }
+    main {
+      position: relative;
+      isolation: isolate;
+      width: min(100%, 430px);
+      max-height: calc(100dvh - 36px);
+      overflow: auto;
+      padding: clamp(27px, 6vh, 42px) clamp(23px, 6vw, 38px) 28px;
+      border: 1px solid #ffffff19;
+      border-radius: 28px;
+      background: linear-gradient(150deg, #18243a 0%, #111a2a 54%, #101725 100%);
+      box-shadow: 0 32px 90px #0009, inset 0 1px #ffffff0c;
+    }
+    main::before {
+      content: "";
+      position: absolute;
+      z-index: -1;
+      inset: 0 15% auto;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, #9dc5ff80, transparent);
+    }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .mark {
+      width: 54px;
+      height: 54px;
+      flex: 0 0 54px;
+      display: block;
+      object-fit: contain;
+      border-radius: 14px;
+      filter: drop-shadow(0 5px 14px #07132680);
+    }
+    .brand-name { margin: 0; color: #f1f6ff; font-size: 23px; font-weight: 760; letter-spacing: .015em; }
+    h1 { margin: clamp(28px, 5vh, 38px) 0 10px; font-size: clamp(25px, 6vw, 31px); line-height: 1.12; letter-spacing: -.045em; }
+    .intro { max-width: 32ch; margin: 0 0 29px; color: #aab7cc; font-size: 14px; line-height: 1.65; }
+    .countdown { margin: 0 0 8px; padding: 10px 15px 8px; border: 1px solid #ffffff12; border-radius: 13px; background: #0b1321a8; }
+    .countdown:not([hidden]) { margin-top: 16px; }
+    .countdown:not([hidden]) + #otp-form { margin-top: 0; }
+    .countdown-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .countdown-label { color: #93a5bf; font-size: 10px; font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }
+    #timer { color: #e5efff; font: 650 21px/1 ui-monospace, SFMono-Regular, Consolas, monospace; font-variant-numeric: tabular-nums; letter-spacing: -.035em; }
+    #timer-unit { margin-left: 4px; color: #91a5c2; font-size: 11px; font-weight: 600; }
+    .timer-track { height: 3px; margin-top: 8px; overflow: hidden; border-radius: 99px; background: #ffffff12; }
+    #timer-progress { display: block; width: 100%; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #52b4ff, #7b86ff); transform: scaleX(1); transform-origin: left center; }
+    .countdown[data-urgent="true"] #timer { color: #ffb4a9; }
+    .countdown[data-urgent="true"] #timer-progress { background: linear-gradient(90deg, #ff9b78, #ff667f); }
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    #otp-form { margin-top: 42px; }
+    .row { display: flex; align-items: stretch; gap: 10px; }
+    input {
+      display: block;
+      flex: 1 1 auto;
+      width: 100%;
+      min-width: 0;
+      height: 46.5px;
+      border: 1px solid #52627b;
+      border-radius: 14px;
+      outline: none;
+      padding: 0 16px;
+      background: #0a111e;
+      color: #f7f9ff;
+      font: 600 25px/1 Inter, "Segoe UI", system-ui, sans-serif;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: .48em;
+      text-align: center;
+      transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+    }
+    input::placeholder { color: #67758c; font-size: 15px; font-weight: 450; letter-spacing: .04em; }
+    input:focus { border-color: #82b5ff; background: #0d1728; box-shadow: 0 0 0 4px #4b91fa24, 0 8px 26px #0003; }
+    button {
+      min-width: 102px;
+      min-height: 52px;
+      border: 0;
+      border-radius: 13px;
+      padding: 0 18px;
+      color: white;
+      font: 700 14px/1 Inter, "Segoe UI", system-ui, sans-serif;
+      cursor: pointer;
+      touch-action: manipulation;
+      transition: transform .14s ease, filter .14s ease, background .14s ease;
+    }
+    button:active:not(:disabled) { transform: translateY(1px) scale(.99); }
+    #send {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: auto;
+      min-width: 92px;
+      min-height: 46.5px;
+      padding: 0 16px;
+      border-radius: 14px;
+      background: linear-gradient(105deg, #438ef2, #5b76f5);
+      box-shadow: 0 9px 24px #345fe54a, inset 0 1px #ffffff36;
+    }
+    #send:hover:not(:disabled) { filter: brightness(1.1); }
+    #resend {
+      display: grid;
+      place-items: center;
+      width: 44px;
+      min-width: 44px;
+      min-height: 44px;
+      margin-top: 9px;
+      margin-left: auto;
+      border: 1px solid #ffffff18;
+      border-radius: 13px;
+      padding: 0;
+      background: #ffffff08;
+      color: #b9c9e1;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    #resend:hover:not(:disabled) { background: #ffffff10; color: #e8f0ff; }
+    #resend svg { width: 17px; height: 17px; }
+    button:disabled { opacity: .58; cursor: wait; filter: saturate(.7); }
+    #status:not([hidden]) {
+      min-height: 42px;
+      display: flex;
+      align-items: center;
+      margin: 16px 0 0;
+      padding: 10px 12px;
+      border: 1px solid #ffffff0e;
+      border-radius: 11px;
+      background: #080f1b80;
+      color: #a8b7ce;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    #status[data-kind="error"] { border-color: #ff7b7b30; background: #4a1e2a55; color: #ffaaaa; }
+    #status[data-kind="success"] { border-color: #61d49c30; background: #123a3155; color: #9ce8c3; }
+    @media (max-height: 680px) {
+      main { padding-top: 22px; padding-bottom: 20px; }
+      #otp-form { margin-top: 28px; }
+      .countdown { margin-bottom: 8px; }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: .01ms !important; } }
+  </style>
+</head>
+<body>
+  <main aria-label="RDPOTP">
+    <div class="brand">
+      <img class="mark" src="rdpotp-icon.png" alt="">
+      <p class="brand-name">RDPOTP</p>
+    </div>
+    <section class="countdown" id="countdown" aria-label="Code expiration timer" hidden>
+      <div class="countdown-head"><span><strong id="timer" role="timer" aria-live="off">60.000</strong><span id="timer-unit">sec</span></span></div>
+      <div class="timer-track" aria-hidden="true"><span id="timer-progress"></span></div>
+    </section>
+    <form id="otp-form">
+      <label class="sr-only" for="otp">One-time code</label>
+      <div class="row">
+        <input id="otp" name="otp" type="password" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" autocomplete="one-time-code" placeholder="Enter PW" required autofocus aria-describedby="status">
+        <button id="send" type="submit" aria-label="Submit" title="Submit">Submit</button>
+      </div>
+      <button id="resend" type="button" aria-label="Resend code" title="Resend code"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M16.2 7.2A6.6 6.6 0 0 0 4.7 5.1L3.5 6.4m0 0V3.8m0 2.6h2.7M3.8 12.8a6.6 6.6 0 0 0 11.5 2.1l1.2-1.3m0 0v2.6m0-2.6h-2.7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      <p id="status" role="status" aria-live="polite" hidden></p>
+    </form>
+  </main>
+  <script>
+    const form = document.getElementById("otp-form");
+    const otp = document.getElementById("otp");
+    const send = document.getElementById("send");
+    const resend = document.getElementById("resend");
+    const status = document.getElementById("status");
+    const countdown = document.getElementById("countdown");
+    const timer = document.getElementById("timer");
+    const timerProgress = document.getElementById("timer-progress");
+    let pendingOtp = null;
+    let pendingResend = false;
+    let countdownInterval = null;
+
+    function startCountdown(seconds) {
+      const durationMs = Math.max(0, Number(seconds) || 60) * 1000;
+      const deadline = performance.now() + durationMs;
+      countdown.hidden = false;
+      if (countdownInterval !== null) clearInterval(countdownInterval);
+      function update() {
+        const remainingMs = Math.max(0, deadline - performance.now());
+        timer.textContent = (remainingMs / 1000).toFixed(3);
+        timerProgress.style.transform = "scaleX(" +
+          (durationMs ? remainingMs / durationMs : 0) + ")";
+        countdown.dataset.urgent = remainingMs <= 10000 ? "true" : "false";
+        if (remainingMs === 0 && countdownInterval !== null) {
+          clearInterval(countdownInterval);
+          countdownInterval = null;
+        }
+      }
+      update();
+      countdownInterval = setInterval(update, 16);
+    }
+
+    // The RDP server consumes this value over its private CDP bridge.
+    // OTP validation and attempt throttling happen on the server, never here.
+    window.__rdpTakeOtp = function () {
+      const value = pendingOtp;
+      pendingOtp = null;
+      return value;
+    };
+    window.__rdpTakeResend = function () {
+      const value = pendingResend;
+      pendingResend = false;
+      return value;
+    };
+    window.__rdpRequestResend = function () {
+      if (resend.disabled) return false;
+      pendingResend = true;
+      resend.disabled = true;
+      status.dataset.kind = "";
+      status.textContent = "";
+      status.hidden = true;
+      return true;
+    };
+    window.__rdpOtpStatus = function (kind, message, ttlSeconds) {
+      status.dataset.kind = kind;
+      status.textContent = kind === "success" ? "" : message;
+      status.hidden = kind === "success";
+      if (kind === "success") startCountdown(ttlSeconds);
+      send.disabled = false;
+      resend.disabled = false;
+      otp.focus();
+      if (kind === "error") { otp.select(); }
+    };
+    resend.addEventListener("click", function () {
+      window.__rdpRequestResend();
+    });
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      if (!otp.value.trim() || send.disabled) return;
+      pendingOtp = otp.value;
+      send.disabled = true;
+      status.dataset.kind = "";
+      status.textContent = "Checking code...";
+    });
+
+    otp.addEventListener("input", function () {
+      otp.value = otp.value.replace(/\D/g, "").slice(0, 4);
+    });
+  </script>
+</body>
+</html>
