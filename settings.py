@@ -25,7 +25,7 @@ def get(section, key, default, cast=str, env=None):
 if __name__ == "__main__":
     import sys
     section, key = sys.argv[1:3]
-    defaults = {("server", "port"): (3390, int, "RDP_PORT")}
+    defaults = {("server", "port"): (3091, int, "RDP_PORT")}
     default, cast, env = defaults[(section, key)]
     print(get(section, key, default, cast, env))
 

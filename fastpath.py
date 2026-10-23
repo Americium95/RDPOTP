@@ -1,4 +1,4 @@
-"""FastPath input PDU parser (MS-RDPBCGR 2.2.8.1.2).  Pure stdlib.
+"""FastPath input parser and output helpers (MS-RDPBCGR).  Pure stdlib.
 
 Reverse-engineered against the FreeRDP sources in this directory and then
 validated byte-for-byte on a live mstsc capture (341 bytes, 6 PDUs,
@@ -37,6 +37,8 @@ Sources: fr_fastpath.c:684-975 (event parsers and the numEvents loop),
 lib_fastpath.h:46-94 (action / eventCode enums), xrdp_rdp.c:1262-1333.
 """
 
+import struct
+
 # --- event codes -----------------------------------------------------------
 CODE_SCANCODE = 0
 CODE_MOUSE = 1
@@ -45,6 +47,89 @@ CODE_SYNC = 3
 CODE_UNICODE = 4
 CODE_MOUSEREL = 5
 CODE_QOE = 6
+
+# TS_SURFCMD_SET_SURFACE_BITS, MS-RDPBCGR 2.2.9.2.1.
+SURFCMD_SET_SURFACE_BITS = 0x0001
+
+
+def build_surface_bits_updates(left, top, width, height, bpp, codec_id, data,
+                               max_packet=16000):
+    """Build Fast-Path Surface Bits output PDUs, fragmenting large updates."""
+    if not (0 <= left <= 0xFFFF and 0 <= top <= 0xFFFF):
+        raise ValueError("surface origin out of range")
+    if not (1 <= width <= 0xFFFF and 1 <= height <= 0xFFFF):
+        raise ValueError("surface dimensions out of range")
+    if not (1 <= max_packet <= 16380):
+        raise ValueError("max_packet out of range")
+    command = (struct.pack("<HHHHH", SURFCMD_SET_SURFACE_BITS,
+                           left, top, left + width, top + height) +
+               struct.pack("<BBBBHHI", bpp, 0, 0, codec_id, width, height,
+                           len(data)) + data)
+    chunks = [command[i:i + max_packet]
+              for i in range(0, len(command), max_packet)]
+    packets = []
+    for index, chunk in enumerate(chunks):
+        fragment = 0 if len(chunks) == 1 else (2 if index == 0 else
+                    1 if index == len(chunks) - 1 else 3)
+        update = bytes((0x04 | (fragment << 4),)) + struct.pack("<H", len(chunk)) + chunk
+        total = 1 + (1 if 1 + len(update) <= 127 else 2) + len(update)
+        if total <= 127:
+            length = bytes((total,))
+        elif total <= 16383:
+            length = bytes((0x80 | (total >> 8), total & 0xFF))
+        else:
+            raise ValueError("fast-path packet exceeds protocol limit")
+        packets.append(b"\x00" + length + update)
+    return packets
+
+
+def build_surface_bits_batch(updates, max_packet=4096):
+    """Pack complete Surface Bits updates into progressive Fast-Path PDUs.
+
+    A tile remains an independent, complete RDP update, but multiple tile
+    updates share one Fast-Path network packet. Oversized single tiles are
+    emitted alone (fragmented only when required by the protocol limit).
+    """
+    if not (1 <= max_packet <= 16000):
+        raise ValueError("max_packet out of range")
+
+    def encode_packet(update_stream):
+        total = 1 + (1 if 1 + len(update_stream) <= 127 else 2) + len(update_stream)
+        if total <= 127:
+            length = bytes((total,))
+        elif total <= 16383:
+            length = bytes((0x80 | (total >> 8), total & 0xFF))
+        else:
+            raise ValueError("fast-path packet exceeds protocol limit")
+        return b"\x00" + length + update_stream
+
+    packets = []
+    stream = bytearray()
+    for item in updates:
+        command = (struct.pack("<HHHHH", SURFCMD_SET_SURFACE_BITS,
+                               item["left"], item["top"],
+                               item["left"] + item["width"],
+                               item["top"] + item["height"]) +
+                   struct.pack("<BBBBHHI", item["bpp"], 0, 0,
+                               item["codec_id"], item["width"],
+                               item["height"], len(item["data"])) + item["data"])
+        update = bytes((0x04,)) + struct.pack("<H", len(command)) + command
+        if stream and len(stream) + len(update) > max_packet:
+            packets.append(encode_packet(bytes(stream)))
+            stream.clear()
+        if len(update) > max_packet:
+            if stream:
+                packets.append(encode_packet(bytes(stream)))
+                stream.clear()
+            packets.extend(build_surface_bits_updates(
+                item["left"], item["top"], item["width"], item["height"],
+                item["bpp"], item["codec_id"], item["data"],
+                max_packet=max_packet))
+            continue
+        stream.extend(update)
+    if stream:
+        packets.append(encode_packet(bytes(stream)))
+    return packets
 
 CODE_NAME = {
     CODE_SCANCODE: "SCANCODE",

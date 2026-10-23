@@ -65,7 +65,8 @@ def _find(state, needle):
 def parse_connect_initial(tpkt_payload):
     res = {"desktop_width": 1024, "desktop_height": 768, "color_depth": 16,
            "client_name": "RDP CLIENT", "client_protocols": 0, "encryption_methods": 0x00000002,
-           "channels": [], "raw": tpkt_payload}
+           "channels": [], "early_capability_flags": 0,
+           "gfx_supported": False, "raw": tpkt_payload}
     try:
         body = tpkt_payload[3:]  # skip 02 f0 80
         # find MCS Connect-Initial APPLICATION 101
@@ -99,6 +100,13 @@ def parse_connect_initial(tpkt_payload):
             cd = unpack("<H", body[pos + 12:pos + 14])[0]
             if 0 < w_ <= 8192 and 0 < h_ <= 8192 and cd in (8, 15, 16, 24, 32):
                 dw, dh, color_depth = w_, h_, (16 if cd == 15 else cd)
+                # MS-RDPBCGR CLIENT_CORE_DATA.earlyCapabilityFlags is the
+                # 16-bit field at byte offset 140 in the Core data payload.
+                # It advertises DYNVC GFX support with bit 0x0100.
+                if blk_len >= 146 and pos + blk_len <= len(body):
+                    early_flags = unpack("<H", body[pos + 4 + 140:pos + 4 + 142])[0]
+                    res["early_capability_flags"] = early_flags
+                    res["gfx_supported"] = bool(early_flags & 0x0100)
                 break
         if dw and dh:
             # clamp to a sane desktop the server is willing to paint

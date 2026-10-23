@@ -145,12 +145,18 @@ def build_cr_routing_token(token):
     return tpkt(body)
 
 
-def build_cc(selected_protocol, client_negotiated):
+RDP_NEG_RSP_EXTENDED_CLIENT_DATA_SUPPORTED = 0x01
+RDP_NEG_RSP_DYNVC_GFX_PROTOCOL_SUPPORTED = 0x02
+
+
+def build_cc(selected_protocol, client_negotiated, server_flags=0):
     varlen = 8 if client_negotiated else 0
     li = 6 + varlen
     body = bytes([li, 0xD0, 0x00, 0x00, 0x12, 0x34, 0x00])
     if client_negotiated:
-        body += bytes([0x02, 0x00, 0x08, 0x00])
+        if not 0 <= server_flags <= 0xFF:
+            raise ValueError("server_flags must fit in one byte")
+        body += bytes([0x02, server_flags, 0x08, 0x00])
         body += (selected_protocol & 0xFFFFFFFF).to_bytes(4, "little")
     return tpkt(body)
 

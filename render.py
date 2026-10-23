@@ -270,3 +270,33 @@ def _fit(rgb: bytes, w: int, h: int, width: int, height: int) -> bytes:
         out[d:d + copy_w * 3] = rgb[s:s + copy_w * 3]
     logging.info("render %dx%d -> fit to %dx%d", w, h, width, height)
     return bytes(out)
+
+
+def resize_rgb(rgb: bytes, w: int, h: int, width: int, height: int) -> bytes:
+    """Resize an RGB frame to the negotiated desktop canvas dimensions."""
+    if (w, h) == (width, height):
+        return rgb
+    if min(w, h, width, height) <= 0 or len(rgb) != w * h * 3:
+        raise ValueError("invalid RGB frame dimensions")
+    try:
+        import io
+        from PIL import Image
+        image = Image.frombytes("RGB", (w, h), rgb)
+        # Nearest-neighbor preserves repeated pixel runs after upscaling.
+        # Bilinear interpolation creates many intermediate colors and made
+        # RDP bitmap compression larger on low-bandwidth links.
+        resampling = getattr(Image, "Resampling", Image).NEAREST
+        resized = image.resize((width, height), resampling)
+        return resized.tobytes()
+    except ImportError:
+        # Pillow is a declared runtime dependency. Retain a safe fallback for
+        # constrained installs; nearest-neighbor keeps the output geometry valid.
+        out = bytearray(width * height * 3)
+        for y in range(height):
+            sy = min(h - 1, y * h // height)
+            for x in range(width):
+                sx = min(w - 1, x * w // width)
+                src = (sy * w + sx) * 3
+                dst = (y * width + x) * 3
+                out[dst:dst + 3] = rgb[src:src + 3]
+        return bytes(out)

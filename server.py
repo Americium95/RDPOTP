@@ -18,6 +18,7 @@ import fastpath
 import ssl_setup
 import hangul_input
 import rdpsnd
+import rdpgfx
 import portal
 import settings
 
@@ -57,49 +58,72 @@ def _map_pointer_to_desktop(x, y, input_width, input_height,
             max(0, min(desktop_height - 1, mapped_y)), outside)
 
 
-VIEWPORT_PROFILE_PATH = pathlib.Path(__file__).with_name("client_viewports.json")
-_VIEWPORT_PROFILE_LOCK = threading.Lock()
-
-
-def _read_viewport_profiles(path=VIEWPORT_PROFILE_PATH):
-    try:
-        data = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    profiles = {}
-    for address, size in data.items():
-        if (isinstance(address, str) and isinstance(size, list) and len(size) == 2
-                and all(isinstance(v, int) and 200 <= v <= 8192 for v in size)):
-            profiles[address] = (size[0] & ~1, size[1])
-    return profiles
-
-
-def _write_viewport_profile(path, address, width, height):
-    if not (isinstance(address, str) and address and
-            200 <= width <= 8192 and 200 <= height <= 8192):
-        return
-    path = pathlib.Path(path)
-    with _VIEWPORT_PROFILE_LOCK:
-        profiles = _read_viewport_profiles(path)
-        profiles[address] = (int(width) & ~1, int(height))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(profiles, separators=(",", ":")),
-                       encoding="utf-8")
-        tmp.replace(path)
-
-
 SEND_POINTER = False
 SKIP_IMAGE = False
-MAX_BANDS = 0
+MAX_TILES = 0
 # Pace bitmap bursts so MSTSC's receive callback is not flooded by a whole
-# desktop worth of bands at once. Both values can be overridden for testing.
+# desktop worth of tiles at once. Both values can be overridden for testing.
 BAND_DELAY = max(0.0, settings.get("server", "band_delay", 0, float, "RDP_BAND_DELAY"))
 MAX_FRAME_RATE = max(0.0, settings.get("server", "max_fps", 30, float, "RDP_MAX_FPS"))
+BITMAP_TILE_WIDTH = 128
+BITMAP_TILE_HEIGHT = 60  # 15,360 raw 16-bpp bytes keeps one tile under 16 KB.
+# Keep graphics batches large enough to avoid a receive callback per small
+# tile, while remaining well below the TPKT/bitmap-update safety ceiling.
+BITMAP_UPDATE_CHUNK_BYTES = settings.get(
+    "server", "bitmap_chunk_bytes", 4096, int, "RDP_BITMAP_CHUNK_BYTES")
+if not 1024 <= BITMAP_UPDATE_CHUNK_BYTES <= 16000:
+    raise ValueError("bitmap_chunk_bytes must be between 1024 and 16000")
+BITMAP_COMPRESSION_MODE = settings.get(
+    "server", "bitmap_compression", "max", str,
+    "RDP_BITMAP_COMPRESSION").strip().lower()
+if BITMAP_COMPRESSION_MODE == "on":
+    BITMAP_COMPRESSION_MODE = "standard"
+if BITMAP_COMPRESSION_MODE not in ("max", "standard", "off"):
+    raise ValueError("bitmap_compression must be max, standard/on, or off")
+NSCODEC_SURFACE_UPDATES = settings.get(
+    "server", "nscodec_surface_updates", False, bool,
+    "RDP_NSCODEC_SURFACE_UPDATES")
+GRAPHICS_CODEC = settings.get(
+    "server", "graphics_codec", "auto", str,
+    "RDP_GRAPHICS_CODEC").strip().lower()
+if GRAPHICS_CODEC not in ("auto", "h264", "bitmap"):
+    raise ValueError("graphics_codec must be auto, h264, or bitmap")
+RENDER_SCALE = settings.get("server", "render_scale", 1.0, float,
+                            "RDP_RENDER_SCALE")
+if not 0.25 <= RENDER_SCALE <= 1.0:
+    raise ValueError("render_scale must be between 0.25 and 1.0")
 SERVER_USER_ID = 1004          # MCS user id assigned to client
 SERVER_INITIATOR = SERVER_USER_ID - contract.MCS_BASE_CHANNEL_ID  # 3
+
+
+def _extract_rgb_region(frame, frame_width, left, top, width, height):
+    """Copy one tightly-packed RGB rectangle from a tightly-packed frame."""
+    row_bytes = frame_width * 3
+    tile_row_bytes = width * 3
+    result = bytearray(tile_row_bytes * height)
+    for row in range(height):
+        start = (top + row) * row_bytes + left * 3
+        dest = row * tile_row_bytes
+        result[dest:dest + tile_row_bytes] = frame[start:start + tile_row_bytes]
+    return bytes(result)
+
+
+def _tile_origins(width, height, tile_width, tile_height, center_first=False):
+    """Return tile origins in paint order, optionally prioritizing the center.
+
+    The OTP form is centered in the RDP canvas. On a slow link, sending its
+    tiles first makes the usable form appear before the full background.
+    """
+    origins = [(left, top)
+               for top in range(0, height, tile_height)
+               for left in range(0, width, tile_width)]
+    if center_first:
+        center_x, center_y = width / 2.0, height / 2.0
+        origins.sort(key=lambda p: (
+            (p[0] + min(tile_width, width - p[0]) / 2.0 - center_x) ** 2 +
+            (p[1] + min(tile_height, height - p[1]) / 2.0 - center_y) ** 2
+        ))
+    return origins
 
 # This branch starts at the phone-OTP portal. RDP_HTML/RDP_HTML_DEFAULT can still
 # override it for diagnostics.
@@ -131,7 +155,7 @@ def _send_otp_notification(code):
         logging.warning("OTP notification URL is not configured")
         return False
     batch = os.environ.get("RDP_NOTIFY_BAT") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "send_notify.bat")
+        os.path.dirname(os.path.abspath(__file__)), "send_notify.bat")
     batch = os.path.abspath(batch)
     if not os.path.isfile(batch):
         logging.warning("OTP notifier batch file is unavailable")
@@ -296,6 +320,16 @@ def _is_portal_page(target: str) -> bool:
     return name.lower() == "pin_portal.html"
 
 
+def _should_use_polling_fallback(portal_page: bool, *, low_fps=False,
+                                 silent=False) -> bool:
+    """Poll active pages when screencast is slow or quiet, but keep OTP push.
+
+    Chrome screencast is damage-driven. A quiet OTP page is normal, and a
+    screenshot round trip for every quiet interval only adds latency.
+    """
+    return not portal_page and (low_fps or silent)
+
+
 def _convert_audio_pcm(pcm, source_format, target_format):
     """Convert captured s16le PCM to the negotiated rdpsnd PCM format."""
     source_channels = source_format.channels
@@ -397,6 +431,27 @@ class RDPConnection:
         self.browser = None
         self._sensitive_page_active = False
         self._redirect_sent = False
+        self._nscodec_id = None
+        self._nscodec_color_loss_level = 3
+        self._surface_bits_supported = False
+        self._client_gfx_supported = False
+        self._rdpgfx_dvc_ready = False
+        self._rdpgfx_dvc_state = "disabled"
+        self._rdpgfx_static_channel_id = None
+        self._rdpgfx_channel_id = None
+        self._rdpgfx_pending_channels = set()
+        self._rdpgfx_dvc_rx = {}
+        self._rdpgfx_vc_rx = bytearray()
+        self._rdpgfx_vc_expected = None
+        self._rdpgfx_caps_confirmed = False
+        self._rdpgfx_avc420 = False
+        self._rdpgfx_codec = None
+        self._rdpgfx_clear_sequence = 0
+        self._rdpgfx_surface_ready = False
+        self._rdpgfx_surface_id = 0
+        self._rdpgfx_frame_id = 0
+        self._rdpgfx_last_frame = None
+        self._rdpgfx_encoder = None
 
         # Set RDP_PERF=1 to emit aggregate capture/paint/send/FPS summaries.
         self._perf_enabled = bool(os.environ.get("RDP_PERF"))
@@ -407,8 +462,8 @@ class RDPConnection:
         self._perf_window_convert_s = 0.0
         self._perf_window_pdu_s = 0.0
         self._perf_window_socket_s = 0.0
-        self._perf_window_sent_bands = 0
-        self._perf_window_skipped_bands = 0
+        self._perf_window_sent_tiles = 0
+        self._perf_window_skipped_tiles = 0
 
     # ---------- transport ----------
     def _fill(self, n):
@@ -499,18 +554,308 @@ class RDPConnection:
                                "client_raw.bin"), "wb") as f:
             f.write(bytes(self.buf))
 
-    def send_pdu(self, user_data, channel_id=contract.MCS_GLOBAL_CHANNEL_ID, quiet=False):
+    def send_pdu(self, user_data, channel_id=contract.MCS_GLOBAL_CHANNEL_ID, quiet=False,
+                 initiator=SERVER_INITIATOR):
         import os as _o2
         if _o2.environ.get("RDP_TRACE_TX"):
             try:
-                logging.info("TX %d bytes pduType=0x%04x type2=0x%02x len=%d",
+                logging.info("TX %d bytes channel=%d initiator=%d pduType=0x%04x type2=0x%02x len=%d data=%s",
                              len(user_data),
+                             channel_id,
+                             initiator,
                              struct.unpack_from("<H", user_data, 2)[0],
                              user_data[14],
-                             struct.unpack_from("<H", user_data, 12)[0])
+                             struct.unpack_from("<H", user_data, 12)[0],
+                             bytes(user_data[:96]).hex())
             except Exception:
                 pass
-        self.send(framing.wrap_pdu(user_data, SERVER_INITIATOR, channel_id), quiet=quiet)
+        self.send(framing.wrap_pdu(user_data, initiator, channel_id), quiet=quiet)
+
+    def _start_rdpgfx_negotiation(self):
+        """Start DVC negotiation only for clients advertising the GFX flag."""
+        if GRAPHICS_CODEC == "bitmap":
+            logging.info("RDPGFX disabled by graphics_codec=bitmap; using bitmap/NSCodec path")
+            return False
+        if not getattr(self, "_client_gfx_supported", False):
+            logging.info("RDPGFX unavailable: client Core earlyCapabilityFlags lacks 0x0100; using bitmap path")
+            return False
+        static_id = getattr(self, "_rdpgfx_static_channel_id", None)
+        if static_id is None:
+            logging.info("RDPGFX unavailable: client did not join drdynvc; using bitmap path")
+            return False
+        self._send_dvc_pdu(rdpgfx.build_dvc_capabilities_request(1))
+        self._rdpgfx_dvc_state = "capabilities_sent"
+        logging.info("DRDYNVC capabilities request sent on static channel %d (version 1)",
+                     static_id)
+        return True
+
+    def _send_dvc_pdu(self, packet):
+        static_id = getattr(self, "_rdpgfx_static_channel_id", None)
+        if static_id is None:
+            return
+        for chunk in rdpsnd.wrap_virtual_channel(packet, chunk_size=1600):
+            # MS-RDPBCGR requires server-originated virtual-channel MCS
+            # SendDataIndication PDUs to use the server channel ID as initiator.
+            # Keep legacy share-PDU framing unchanged while validating GFX.
+            self.send_pdu(chunk, static_id, quiet=True,
+                          initiator=contract.MCS_SERVER_CHANNEL_ID)
+
+    def _send_gfx_pdu(self, packet):
+        """Send one server graphics PDU as a DVC message, including wrapper."""
+        if self._rdpgfx_channel_id is None:
+            raise ValueError("RDPGFX DVC channel is not open")
+        wire_message = rdpgfx.wrap_server_gfx_message(packet)
+        for dvc_packet in rdpgfx.fragment_dvc_message(
+                self._rdpgfx_channel_id, wire_message):
+            self._send_dvc_pdu(dvc_packet)
+
+    def _activate_rdpgfx_surface(self):
+        if not self._rdpgfx_caps_confirmed or self._rdpgfx_surface_ready:
+            return False
+        encoder = None
+        codec = "AVC420" if self._rdpgfx_avc420 else "ClearCodec-raw"
+        try:
+            if self._rdpgfx_avc420:
+                fps = max(1, int(MAX_FRAME_RATE)) if MAX_FRAME_RATE else 30
+                encoder = rdpgfx.H264FrameEncoder(
+                    self.width, self.height, fps=fps, qp=23)
+            self._send_gfx_pdu(rdpgfx.build_gfx_reset_graphics(
+                self.width, self.height))
+            # Surface 0 is the implicit primary graphics output surface. It is
+            # mapped directly after RESET_GRAPHICS; offscreen surfaces use
+            # CREATE_SURFACE with a nonzero ID.
+            if self._rdpgfx_surface_id != 0:
+                self._send_gfx_pdu(rdpgfx.build_gfx_create_surface(
+                    self._rdpgfx_surface_id, self.width, self.height))
+            self._send_gfx_pdu(rdpgfx.build_gfx_map_surface_to_output(
+                self._rdpgfx_surface_id, 0, 0))
+        except ClientAbort:
+            try:
+                encoder.close()
+            except Exception:
+                pass
+            raise
+        except Exception:
+            logging.exception("RDPGFX %s surface setup failed; using bitmap path", codec)
+            try:
+                encoder.close()
+            except Exception:
+                pass
+            self._rdpgfx_avc420 = False
+            return False
+        self._rdpgfx_encoder = encoder
+        self._rdpgfx_codec = "AVC420" if self._rdpgfx_avc420 else "CLEARCODEC"
+        self._rdpgfx_clear_sequence = 0
+        self._rdpgfx_surface_ready = True
+        logging.info("RDPGFX surface ready: surface=%d size=%dx%d codec=%s",
+                     self._rdpgfx_surface_id, self.width, self.height, codec)
+        previous = getattr(self, "_last_frame", None)
+        if previous is not None:
+            tiles = (((self.width + BITMAP_TILE_WIDTH - 1) // BITMAP_TILE_WIDTH) *
+                     ((self.height + BITMAP_TILE_HEIGHT - 1) // BITMAP_TILE_HEIGHT))
+            self._paint_rdpgfx(previous, tiles, drain=False)
+        return True
+
+    def _handle_gfx_message(self, message):
+        """Consume complete client-to-server RDPGFX messages."""
+        message = bytes(message)
+        offset = 0
+        while offset < len(message):
+            command, payload, length = rdpgfx.parse_gfx_pdu(message[offset:])
+            if length > len(message) - offset:
+                raise ValueError("RDPGFX message exceeds DVC payload")
+            if command == rdpgfx.GFX_CAPS_ADVERTISE:
+                capsets = rdpgfx.parse_gfx_caps_advertise(payload)
+                logging.info("RDPGFX client capsets: %s",
+                             ", ".join("version=0x%08x length=%d data=%s" %
+                                       (version, length, data.hex())
+                                       for version, length, data in capsets))
+                selected = rdpgfx.select_graphics_capset(capsets)
+                if selected is None:
+                    self._rdpgfx_caps_confirmed = False
+                    self._rdpgfx_avc420 = False
+                    logging.info("RDPGFX fallback: no supported v8/v8.1 capability set; using bitmap path")
+                else:
+                    version, cap_data, avc420 = selected
+                    self._send_gfx_pdu(rdpgfx.build_gfx_caps_confirm(version, cap_data))
+                    self._rdpgfx_caps_confirmed = True
+                    self._rdpgfx_avc420 = avc420
+                    logging.info("RDPGFX capabilities confirmed version=0x%08x AVC420=%s",
+                                 version, avc420)
+                    self._activate_rdpgfx_surface()
+            elif command in (0x000D, 0x0016):
+                # Frame/QoE acknowledgements carry no state needed by this
+                # unacknowledged, one-frame-at-a-time AVC420 sender.
+                logging.debug("RDPGFX acknowledgement received cmd=0x%04x", command)
+            else:
+                logging.debug("RDPGFX client PDU ignored cmd=0x%04x", command)
+            offset += length
+
+    def _handle_drdynvc_data(self, static_channel_id, data):
+        """Handle DVC control/data PDUs and route the opened GFX channel."""
+        if (getattr(self, "_rdpgfx_static_channel_id", None) is None or
+                static_channel_id != self._rdpgfx_static_channel_id):
+            return False
+        try:
+            vc = rdpsnd.parse_virtual_channel(data)
+            flags = vc["flags"]
+            if flags & rdpsnd.CHANNEL_FLAG_FIRST:
+                self._rdpgfx_vc_rx = bytearray()
+                self._rdpgfx_vc_expected = vc["total_length"]
+            elif self._rdpgfx_vc_expected is None:
+                raise ValueError("DRDYNVC static-channel fragment without FIRST")
+            expected = self._rdpgfx_vc_expected
+            if expected is None or expected > 1_048_576:
+                raise ValueError("invalid DRDYNVC static-channel length")
+            self._rdpgfx_vc_rx.extend(vc["data"])
+            if len(self._rdpgfx_vc_rx) > expected:
+                raise ValueError("DRDYNVC static-channel fragments exceed total length")
+            if flags & rdpsnd.CHANNEL_FLAG_LAST:
+                if len(self._rdpgfx_vc_rx) != expected:
+                    raise ValueError("DRDYNVC static-channel LAST length mismatch")
+                data = bytes(self._rdpgfx_vc_rx)
+                self._rdpgfx_vc_rx.clear()
+                self._rdpgfx_vc_expected = None
+            else:
+                return True
+            pdu_info = rdpgfx.parse_dvc_pdu(data)
+            command = pdu_info["command"]
+            if command == "capabilities":
+                if self._rdpgfx_dvc_state != "capabilities_sent":
+                    return True
+                if pdu_info["version"] < 1:
+                    self._rdpgfx_dvc_state = "disabled"
+                    logging.info("DRDYNVC rejected version %d; using bitmap path",
+                                 pdu_info["version"])
+                    return True
+                channel_id = 1
+                while channel_id in self._rdpgfx_pending_channels:
+                    channel_id += 1
+                self._rdpgfx_pending_channels.add(channel_id)
+                self._rdpgfx_channel_id = channel_id
+                self._send_dvc_pdu(rdpgfx.build_dvc_create_request(channel_id))
+                self._rdpgfx_dvc_state = "channel_create_sent"
+                logging.info("DRDYNVC graphics channel create requested id=%d name=%s",
+                             channel_id, rdpgfx.GFX_CHANNEL_NAME)
+                return True
+            if command == "create_request":
+                # Reserve client-selected IDs to prevent collision with our
+                # server-initiated Graphics channel; unsupported channels are
+                # rejected explicitly so the static DVC manager stays usable.
+                client_id = pdu_info["channel_id"]
+                self._rdpgfx_pending_channels.add(client_id)
+                self._send_dvc_pdu(rdpgfx.build_dvc_create_response(
+                    client_id, status=0xC0000225))  # STATUS_NOT_FOUND
+                logging.info("DRDYNVC client channel rejected name=%s id=%d",
+                             pdu_info.get("name"), client_id)
+                return True
+            if command == "create_response":
+                if pdu_info["channel_id"] != self._rdpgfx_channel_id:
+                    return True
+                if pdu_info["status"] != 0:
+                    self._rdpgfx_channel_id = None
+                    self._rdpgfx_dvc_state = "disabled"
+                    logging.info("DRDYNVC graphics channel open failed status=0x%08x; using bitmap path",
+                                 pdu_info["status"])
+                    return True
+                self._rdpgfx_dvc_state = "channel_open"
+                self._rdpgfx_dvc_ready = True
+                logging.info("DRDYNVC graphics channel open id=%d", pdu_info["channel_id"])
+                return True
+            if command == "data_first":
+                message_length = pdu_info["length"]
+                first = pdu_info["data"]
+                if message_length > 1_048_576 or len(first) > message_length:
+                    raise ValueError("oversized or inconsistent DVC message")
+                if pdu_info["channel_id"] == self._rdpgfx_channel_id:
+                    if len(first) == message_length:
+                        self._handle_gfx_message(first)
+                    else:
+                        self._rdpgfx_dvc_rx[pdu_info["channel_id"]] = [message_length,
+                                                                      bytearray(first)]
+                return True
+            if command == "data":
+                channel_id = pdu_info["channel_id"]
+                fragment = pdu_info["data"]
+                pending = self._rdpgfx_dvc_rx.get(channel_id)
+                if pending is not None:
+                    expected, accumulated = pending
+                    if len(accumulated) + len(fragment) > expected:
+                        del self._rdpgfx_dvc_rx[channel_id]
+                        raise ValueError("DVC fragments exceed declared message length")
+                    accumulated.extend(fragment)
+                    if len(accumulated) == expected:
+                        del self._rdpgfx_dvc_rx[channel_id]
+                        if channel_id == self._rdpgfx_channel_id:
+                            self._handle_gfx_message(accumulated)
+                elif channel_id == self._rdpgfx_channel_id:
+                    self._handle_gfx_message(fragment)
+                return True
+            if command == "close" and pdu_info["channel_id"] == self._rdpgfx_channel_id:
+                self._rdpgfx_dvc_ready = False
+                self._rdpgfx_surface_ready = False
+                self._rdpgfx_avc420 = False
+                self._rdpgfx_dvc_state = "closed"
+                self._close_rdpgfx_encoder()
+                logging.info("DRDYNVC graphics channel closed; using bitmap path")
+                return True
+            return True
+        except ClientAbort:
+            raise
+        except Exception:
+            logging.exception("DRDYNVC graphics dispatch failed; retaining bitmap path")
+            self._rdpgfx_dvc_state = "disabled"
+            self._rdpgfx_dvc_ready = False
+            self._rdpgfx_avc420 = False
+            self._rdpgfx_surface_ready = False
+            self._rdpgfx_vc_rx.clear()
+            self._rdpgfx_vc_expected = None
+            self._close_rdpgfx_encoder()
+            return True
+
+    def _close_rdpgfx_encoder(self):
+        encoder, self._rdpgfx_encoder = self._rdpgfx_encoder, None
+        if encoder is not None:
+            try:
+                encoder.close()
+            except Exception:
+                logging.debug("RDPGFX encoder close failed", exc_info=True)
+
+    def _paint_rdpgfx(self, rgb, total_tiles, *, drain=True):
+        """Send a full-surface frame using the negotiated RDPGFX codec."""
+        frame_id = self._rdpgfx_frame_id
+        timestamp = int(time.monotonic() * 1000) & 0xFFFFFFFF
+        try:
+            if self._rdpgfx_codec == "AVC420":
+                bitstream = self._rdpgfx_encoder.encode(rgb)
+                bitmap_pdu = rdpgfx.build_wire_to_surface_avc420(
+                    self._rdpgfx_surface_id, (0, 0, self.width, self.height),
+                    bitstream, qp=self._rdpgfx_encoder.qp)
+                payload_bytes = len(bitstream)
+            else:
+                sequence = self._rdpgfx_clear_sequence
+                stream = rdpgfx.build_clearcodec_bitmap_stream(
+                    self.width, self.height, rgb, sequence)
+                bitmap_pdu = rdpgfx.build_wire_to_surface_clearcodec(
+                    self._rdpgfx_surface_id, (0, 0, self.width, self.height), stream)
+                self._rdpgfx_clear_sequence = (sequence + 1) & 0xFF
+                payload_bytes = len(stream)
+        except Exception:
+            logging.exception("RDPGFX frame encode failed; reverting to bitmap path")
+            self._rdpgfx_avc420 = False
+            self._rdpgfx_surface_ready = False
+            self._close_rdpgfx_encoder()
+            return None
+        self._send_gfx_pdu(rdpgfx.build_gfx_frame_start(frame_id, timestamp))
+        self._send_gfx_pdu(bitmap_pdu)
+        self._send_gfx_pdu(rdpgfx.build_gfx_frame_end(frame_id))
+        self._rdpgfx_frame_id = (frame_id + 1) & 0xFFFFFFFF
+        self._rdpgfx_last_frame = rgb
+        logging.info("RDPGFX %s frame sent frame=%d bytes=%d",
+                     self._rdpgfx_codec, frame_id, payload_bytes)
+        if drain:
+            self._drain_input()
+        return 1, max(0, total_tiles - 1)
 
     # ---------- flow ----------
     def run(self):
@@ -525,6 +870,9 @@ class RDPConnection:
             self._capability_exchange()
             self._start_rdpsnd_negotiation()
             self._finalization()
+            # Open RDPGFX only after the full core activation handshake
+            # (including control grant and Font Map) has completed.
+            self._start_rdpgfx_negotiation()
             self._send_image()
             if self._redirect_sent:
                 # MS-RDPBCGR 3.2.5.13.1: once the client has processed the
@@ -540,6 +888,7 @@ class RDPConnection:
         except Exception:
             logging.exception("conn error")
         finally:
+            self._close_rdpgfx_encoder()
             self._stop_audio()
             if self.browser is not None:
                 self.browser.stop()
@@ -582,12 +931,15 @@ class RDPConnection:
             return
         rproto = neg["requested_protocols"]
         self.requested_protocols = rproto
+        neg_flags = framing.RDP_NEG_RSP_EXTENDED_CLIENT_DATA_SUPPORTED
+        if GRAPHICS_CODEC != "bitmap":
+            neg_flags |= framing.RDP_NEG_RSP_DYNVC_GFX_PROTOCOL_SUPPORTED
         if rproto & 0x1:
-            self.send(framing.build_cc(1, True))
+            self.send(framing.build_cc(1, True, neg_flags))
             logging.info("cc sel=1 SSL")
             self._start_tls()
         else:
-            self.send(framing.build_cc(0, True))
+            self.send(framing.build_cc(0, True, neg_flags))
             logging.info("cc sel=0 RDP")
 
     def _proxy_to_native_rdp(self):
@@ -681,22 +1033,14 @@ class RDPConnection:
     def _connect_initial(self):
         raw = self.read_tpkt()
         info = gcc.parse_connect_initial(raw[4:])
+        client_gfx_flag = bool(info.get("gfx_supported"))
         self.width = info["desktop_width"] or self.width
         self.height = info["desktop_height"] or self.height
         self.bpp = info["color_depth"] or self.bpp
-        if self.bpp <= 16:
-            # Cap low-colour sessions by pixel count without independently
-            # clipping width and height; independent caps distort phone views.
-            pixels = self.width * self.height
-            if pixels > 1_000_000:
-                scale = math.sqrt(1_000_000 / pixels)
-                self.width = max(2, int(self.width * scale) & ~1)
-                self.height = max(1, int(self.height * scale))
-        profile = _read_viewport_profiles().get(self.client_addr)
-        if profile:
-            self.width, self.height = profile
-            logging.info("using remembered client viewport %dx%d for %s",
-                         self.width, self.height, self.client_addr)
+        # The dimensions in Client Core Data are the negotiated RDP canvas.
+        # A previously observed client viewport may be a phone's portrait
+        # dimensions; using it here changes the server desktop and can make
+        # the captured frame disagree with the canvas mstsc requested.
         self.input_width = self.width
         self.input_height = self.height
         n = len(info["channels"]) or 4
@@ -707,11 +1051,22 @@ class RDPConnection:
             channel.get("name", "").rstrip("\0"): cid
             for channel, cid in zip(info["channels"], self.channel_ids)
         }
+        self._rdpgfx_static_channel_id = next(
+            (cid for name, cid in self.static_channels.items()
+             if name.casefold() == "drdynvc"), None)
+        self._client_gfx_supported = (client_gfx_flag and
+                                      self._rdpgfx_static_channel_id is not None and
+                                      GRAPHICS_CODEC != "bitmap")
         logging.info(
             "client desktop %dx%d bpp=%s chans=%s -> ids %s",
             self.width, self.height, info["color_depth"],
             [c["name"] for c in info["channels"]], self.channel_ids,
         )
+        logging.info("graphics_codec=%s client GFX support=%s earlyCapabilityFlags=0x%04x drdynvc=%s",
+                     GRAPHICS_CODEC,
+                     self._client_gfx_supported,
+                     info.get("early_capability_flags", 0),
+                     self._rdpgfx_static_channel_id)
         resp = gcc.build_connect_response(
             self.width, self.height, self.channel_ids, self.requested_protocols
         )
@@ -801,6 +1156,11 @@ class RDPConnection:
                 logging.info("client aborted before confirm active")
                 break
             parsed = gcc.parse_domain_pdu(raw)
+            channel_id = parsed.get("channel_id")
+            if channel_id == self._rdpgfx_static_channel_id:
+                self._handle_drdynvc_data(channel_id,
+                                           parsed.get("user_data") or b"")
+                continue
             ud = parsed.get("user_data") or b""
             if len(ud) < 6:
                 continue
@@ -808,15 +1168,27 @@ class RDPConnection:
             logging.info("capability exchange rx pdu_type=%d", pt)
             if pt == 3:
                 info = pdu.parse_confirm_active(ud)
+                self._nscodec_id = info.get("nscodec_id")
+                client_cll = info.get("nscodec_color_loss_level")
+                if client_cll and 1 <= client_cll <= 7:
+                    self._nscodec_color_loss_level = min(3, client_cll)
+                self._surface_bits_supported = bool(
+                    info.get("surface_command_flags", 0) & 0x00000002)
+                if self._nscodec_id is not None and self._surface_bits_supported:
+                    logging.info("NSCodec negotiated: codec_id=%d color_loss=%d",
+                                 self._nscodec_id,
+                                 self._nscodec_color_loss_level)
+                else:
+                    logging.info("NSCodec unavailable; using legacy bitmap RLE")
                 if (0 < info["desktop_width"] <= 8192 and
                         0 < info["desktop_height"] <= 8192):
                     self.input_width = info["desktop_width"]
                     self.input_height = info["desktop_height"]
-                    _write_viewport_profile(
-                        VIEWPORT_PROFILE_PATH, self.client_addr,
-                        self.input_width, self.input_height)
-                logging.info("confirm active %s (desktop %dx%d)",
-                            info, self.width, self.height)
+                logging.info("confirm active client viewport %dx%d; "
+                             "render canvas remains %dx%d",
+                             self.input_width, self.input_height,
+                             self.width, self.height)
+                logging.debug("confirm active capabilities %s", info)
                 fit_scale = min(self.input_width / max(1, self.width),
                                 self.input_height / max(1, self.height))
                 logging.info(
@@ -867,9 +1239,16 @@ class RDPConnection:
                          self._audio_format.channels, self._audio_format.bits_per_sample,
                          self._audio_alive)
             if self._audio_alive:
-                if reply["version"] < 6:
-                    self._send_rdpsnd_training()
-                self._start_audio_capture()
+                if self._sensitive_page_active:
+                    # The OTP portal is static UI. Capturing loopback silence
+                    # wastes scarce bandwidth and competes with its first
+                    # bitmap updates; native RDP starts after OTP redirection.
+                    self._audio_alive = False
+                    logging.info("rdpsnd playback disabled for OTP portal")
+                else:
+                    if reply["version"] < 6:
+                        self._send_rdpsnd_training()
+                    self._start_audio_capture()
             else:
                 logging.warning("rdpsnd client did not advertise audio playback capability")
         elif parsed["msg_type"] == rdpsnd.SNDC_WAVECONFIRM:
@@ -1051,6 +1430,10 @@ class RDPConnection:
                 break
             parsed = gcc.parse_domain_pdu(raw)
             channel_id = parsed.get("channel_id")
+            if channel_id == self._rdpgfx_static_channel_id:
+                self._handle_drdynvc_data(channel_id,
+                                           parsed.get("user_data") or b"")
+                continue
             if channel_id == self.static_channels.get("rdpsnd"):
                 try:
                     self._handle_rdpsnd_channel(channel_id, parsed.get("user_data") or b"")
@@ -1093,17 +1476,7 @@ class RDPConnection:
 
         import os as _os
         self.bpp = int(_os.environ.get('RDP_BPP') or 0) or self.bpp
-        bpp_bytes = self.bpp // 8
-        stride = (self.width * bpp_bytes + 3) & ~3
-        # mstsc aborts (0x2904) any single Bitmap Update whose TPKT exceeds
-        # 16384 bytes.  Measured: 1024x5@24 (TPKT 15429) survives, 1024x6
-        # (TPKT 18501) resets.  Fixed overhead per band PDU:
-        #   TPKT(4) + MCS SDIN(7) + share control/data(18)
-        #   + update header(4) + bitmap cache entry(18) + TS_BITMAP_DATA(18)
-        # = 69 bytes, so band*stride must stay under the limit minus that.
-        MAX_TPKT = 16000
-        band = max(1, (MAX_TPKT - 69) // stride)
-        band = int(_os.environ.get('RDP_BAND_ROWS') or 0) or band
+        tile_width, tile_height = BITMAP_TILE_WIDTH, BITMAP_TILE_HEIGHT
 
         # A live URL goes straight to the persistent browser: taking one
         # throwaway screenshot first would stall the session for many seconds
@@ -1111,10 +1484,11 @@ class RDPConnection:
         _html0 = _normalize_page_target(_os.environ.get("RDP_HTML") or DEFAULT_HTML)
         if _html0.startswith(("http://", "https://", "file://")) and \
                 not _os.environ.get("RDP_STATIC", ""):
-            logging.info("initial frame: %dx%d bpp=%d stride=%d band=%d rows",
-                         self.width, self.height, self.bpp, stride, band)
+            logging.info("initial frame: %dx%d bpp=%d tile=%dx%d",
+                         self.width, self.height, self.bpp,
+                         tile_width, tile_height)
             try:
-                self._browser_session(_html0, band)
+                self._browser_session(_html0, tile_width)
                 return
             except ClientAbort:
                 raise
@@ -1125,9 +1499,10 @@ class RDPConnection:
 
         img = self._frame_source()
         logging.info(
-            "sending image %dx%d bpp=%d stride=%d band=%d rows (%d bands)",
-            self.width, self.height, self.bpp, stride, band,
-            (self.height + band - 1) // band,
+            "sending image %dx%d bpp=%d tiles=%dx%d (%d rectangles)",
+            self.width, self.height, self.bpp, tile_width, tile_height,
+            ((self.width + tile_width - 1) // tile_width) *
+            ((self.height + tile_height - 1) // tile_height),
         )
 
         # make sure the client has left Confirm Active before painting
@@ -1194,11 +1569,11 @@ class RDPConnection:
 
         import time as _time
         import os as _oe2
-        sent, skipped = self._paint(img, band, force=True)
-        logging.info("image complete (%d bands sent, %d unchanged skipped)", sent, skipped)
+        sent, skipped = self._paint(img, tile_width, force=True)
+        logging.info("image complete (%d rectangles sent, %d unchanged skipped)", sent, skipped)
 
         # Keep the session alive and re-paint when the source changes.
-        # Only bands whose pixels actually changed are sent (band diffing).
+        # Only tiles whose pixels actually changed are sent (tile diffing).
         html = _oe2.environ.get("RDP_HTML") or DEFAULT_HTML
         if not html or not _is_renderable(html):
             self._read_loop()
@@ -1211,7 +1586,7 @@ class RDPConnection:
         last_sig = None
 
         # Client input drives the screen: any key press marks the frame dirty
-        # so the watch loop re-renders and pushes only the changed bands.
+        # so the watch loop re-renders and pushes only the changed tiles.
         # This is the input -> output half of the session.
         def _on_input(ev):
             if ev["code"] == fastpath.CODE_SCANCODE and not ev["released"]:
@@ -1240,9 +1615,9 @@ class RDPConnection:
                     logging.warning("re-render failed: %s", exc)
                     _time.sleep(interval)
                     continue
-                s, k = self._paint(new, band)
+                s, k = self._paint(new, tile_size)
                 reason = "input" if dirty else "source"
-                logging.info("repaint (%s): %d bands sent, %d unchanged skipped",
+                logging.info("repaint (%s): %d tiles sent, %d unchanged skipped",
                              reason, s, k)
             _time.sleep(interval)
 
@@ -1286,7 +1661,7 @@ class RDPConnection:
             return "127.0.0.1"
 
     # ---------- live browser session ----------
-    def _browser_session(self, html, band):
+    def _browser_session(self, html, tile_size):
         """Drive a persistent headless Chrome over CDP and stream its frames.
 
         Chrome pushes frames via Page.startScreencast when the compositor has
@@ -1348,6 +1723,8 @@ class RDPConnection:
                               type(exc).__name__)
         otp_challenge = None
         otp_delivery_ok = False
+        otp_delivery_event = None
+        otp_delivery_result = {}
         if portal_page:
             allowed, retry_after = OTP_RATE_LIMITER.allow(self.client_addr)
             if allowed:
@@ -1355,28 +1732,32 @@ class RDPConnection:
                     self.client_addr, ttl_seconds=OTP_TTL_SECONDS,
                     max_attempts=OTP_MAX_ATTEMPTS)
                 otp_code = otp_challenge.take_delivery_code()
-                otp_delivery_ok = _send_otp_notification(otp_code)
+                otp_delivery_event = threading.Event()
+
+                def deliver_initial_otp(code):
+                    try:
+                        otp_delivery_result["ok"] = _send_otp_notification(code)
+                    finally:
+                        otp_delivery_event.set()
+
+                threading.Thread(target=deliver_initial_otp, args=(otp_code,),
+                                 name="rdpotp-initial-notify", daemon=True).start()
                 otp_code = None
-                if not otp_delivery_ok:
-                    otp_challenge.invalidate()
-                    status = "Notification delivery failed. Reconnect and try again."
-                    logging.warning("OTP delivery failed for a portal connection")
-                else:
-                    status = "Access code ready. Enter it to continue."
-                    logging.info("OTP notification sent for a portal connection")
+                status = "Sending access code..."
             else:
                 status = "Too many codes requested. Try again in %d seconds." % retry_after
                 logging.warning("OTP notification rate limit reached")
             br.evaluate("window.__rdpOtpStatus && window.__rdpOtpStatus(%s, %s, %s)" % (
-                json.dumps("error" if not otp_delivery_ok else "success"),
+                json.dumps("error" if not allowed else "success"),
                 json.dumps(status),
                 json.dumps(otp_challenge.seconds_remaining()
-                           if otp_delivery_ok and otp_challenge is not None
-                           else 0.0)))
+                           if allowed and otp_challenge is not None else 0.0)))
         if not portal_page:
             self._start_audio_capture()
 
-        scale = float(os.environ.get("RDP_CAST_SCALE") or 1.0)
+        scale = float(os.environ.get("RDP_CAST_SCALE") or RENDER_SCALE)
+        if not 0.25 <= scale <= 1.0:
+            raise ValueError("RDP_CAST_SCALE must be between 0.25 and 1.0")
         interval = float(os.environ.get("RDP_HTML_INTERVAL") or 0.03)
         logging.info("streaming %s (screencast scale=%.2f, interval=%.3fs)",
                      html, scale, interval)
@@ -1585,8 +1966,10 @@ class RDPConnection:
         # Start screencast with JPEG + NVENC decode
 # JPEG q=60 is the sweet spot; 70+ gives diminishing returns on size.
         # maxFramesInFlight=5 + sendLastFrame keeps the Chrome pipe full.
-        br.start_screencast(quality=int(os.environ.get("RDP_CAST_QUALITY") or 60),
-                            scale=scale)
+        cast_format = "png" if portal_page else "jpeg"
+        br.start_screencast(
+            quality=int(os.environ.get("RDP_CAST_QUALITY") or 60),
+            scale=scale, format=cast_format)
 
         frames = 0
         last_change = time.time()
@@ -1599,9 +1982,9 @@ class RDPConnection:
         USE_POLLING = False
         MIN_CAST_FPS = 15.0
         EVAL_WINDOW = 2.0
-        # Polling at full res is slower per frame, but the numpy pixel packing
-        # made it affordable (~0.004s/frame), so keep 1:1 pixels on the screen.
-        poll_scale = float(os.environ.get("RDP_POLL_SCALE") or 1.0)
+        # Keep fallback polling on the same capture scale. Browser.screenshot
+        # resizes each frame back to the negotiated RDP canvas before painting.
+        poll_scale = float(os.environ.get("RDP_POLL_SCALE") or scale)
         # Never exit this loop on a capture error: leaving it used to drop the
         # session into _read_loop(), which keeps draining input but paints
         # nothing -- the screen froze while keystrokes still worked.
@@ -1614,6 +1997,24 @@ class RDPConnection:
         def check_portal_otp():
             """Process code resend and verification over the private CDP bridge."""
             nonlocal otp_challenge, otp_delivery_ok
+            if otp_delivery_event is not None and otp_delivery_event.is_set():
+                delivered = bool(otp_delivery_result.get("ok"))
+                otp_delivery_event.clear()
+                if delivered:
+                    otp_delivery_ok = True
+                    status = "Access code ready. Enter it to continue."
+                    logging.info("OTP notification sent for a portal connection")
+                    br.evaluate("window.__rdpOtpStatus && window.__rdpOtpStatus('success', %s, %s)" % (
+                        json.dumps(status),
+                        json.dumps(otp_challenge.seconds_remaining()
+                                   if otp_challenge is not None else 0.0)))
+                else:
+                    if otp_challenge is not None:
+                        otp_challenge.invalidate()
+                    status = "Notification delivery failed. Reconnect and try again."
+                    logging.warning("OTP notification failed for a portal connection")
+                    br.evaluate("window.__rdpOtpStatus && window.__rdpOtpStatus('error', %s)" %
+                                json.dumps(status))
             if (otp_delivery_ok and otp_challenge is not None and
                     otp_challenge.is_expired()):
                 otp_challenge.invalidate()
@@ -1631,6 +2032,11 @@ class RDPConnection:
             except (TypeError, ValueError):
                 requests = {}
             resend_requested = requests.get("resend") is True
+            if (resend_requested and otp_delivery_event is not None and
+                    not otp_delivery_event.is_set()):
+                br.evaluate("window.__rdpOtpStatus && window.__rdpOtpStatus('success', %s)" %
+                            json.dumps("Sending access code..."))
+                return False
             if resend_requested:
                 allowed, retry_after = OTP_RATE_LIMITER.allow(self.client_addr)
                 if not allowed:
@@ -1662,10 +2068,12 @@ class RDPConnection:
                     br.evaluate("window.__rdpOtpStatus && window.__rdpOtpStatus('error', %s)"
                                 % json.dumps(message))
                 return False
-            if not otp_delivery_ok or otp_challenge is None:
-                return False
             candidate = requests.get("otp")
             if candidate is None:
+                return False
+            if not otp_delivery_ok or otp_challenge is None:
+                br.evaluate("window.__rdpOtpStatus && window.__rdpOtpStatus('error', %s)" %
+                            json.dumps("Notification delivery failed. Reconnect and try again."))
                 return False
             accepted, result = otp_challenge.verify(candidate, self.client_addr)
             if accepted:
@@ -1722,7 +2130,8 @@ class RDPConnection:
                 now = time.time()
                 if now - cast_start >= EVAL_WINDOW:
                     fps = cast_frames / (now - cast_start)
-                    if fps < MIN_CAST_FPS:
+                    if _should_use_polling_fallback(
+                            portal_page, low_fps=fps < MIN_CAST_FPS):
                         logging.info("cast fps %.1f < %.1f -> switching to JPEG polling (scale=%.2f)",
                                      fps, MIN_CAST_FPS, poll_scale)
                         USE_POLLING = True
@@ -1736,7 +2145,7 @@ class RDPConnection:
                 try:
                     pace_paint()
                     send_before = self._perf_socket_send_s
-                    s, k = self._paint(frame, band)
+                    s, k = self._paint(frame, tile_size)
                 except ClientAbort:
                     raise
                 except Exception:
@@ -1750,12 +2159,15 @@ class RDPConnection:
                 )
                 frames += 1
                 if s:
-                    logging.info("cast frame #%d: %d bands sent, %d unchanged",
+                    logging.info("cast frame #%d: %d tiles sent, %d unchanged",
                                  frames, s, k)
                 continue
 
             # Screencast idle or switched to polling -> use JPEG capture
-            if not USE_POLLING and time.time() - last_cast < fallback:
+            silent = time.time() - last_cast >= fallback
+            if (not USE_POLLING and
+                    not _should_use_polling_fallback(portal_page,
+                                                     silent=silent)):
                 continue
             if not USE_POLLING:
                 logging.info("screencast silent -> JPEG polling (scale=%.2f)", poll_scale)
@@ -1780,7 +2192,7 @@ class RDPConnection:
                         br.recover()
                         br.start_screencast(
                             quality=int(os.environ.get("RDP_CAST_QUALITY") or 60),
-                            scale=scale)
+                            scale=scale, format=cast_format)
                         USE_POLLING = False
                         last_cast = time.time()
                         cast_start = last_cast
@@ -1794,7 +2206,7 @@ class RDPConnection:
             try:
                 pace_paint()
                 send_before = self._perf_socket_send_s
-                s, k = self._paint(shot, band)
+                s, k = self._paint(shot, tile_size)
             except ClientAbort:
                 raise
             except Exception:
@@ -1809,7 +2221,7 @@ class RDPConnection:
             frames += 1
             now = time.time()
             if s or frames <= 3:
-                logging.info("jpeg frame #%d: %d bands sent, %d unchanged",
+                logging.info("jpeg frame #%d: %d tiles sent, %d unchanged",
                              frames, s, k)
                 last_change = now
             elif now - last_change >= 10.0:
@@ -1821,71 +2233,206 @@ class RDPConnection:
                 last_change = now
             time.sleep(0.005)
 
-    def _paint(self, img, band, force=False):
-        """Send the bands of img that differ from the last painted frame.
-
-        Band diffing is what makes updates cheap: an unchanged band costs
-        nothing on the wire instead of a full re-paint of the screen.
-        """
-        bpp_bytes = self.bpp // 8
-        stride = (self.width * bpp_bytes + 3) & ~3
+    def _paint(self, img, tile_size=BITMAP_TILE_WIDTH, force=False):
+        """Send changed screen rectangles using the negotiated MSTSC codecs."""
+        tile_width = BITMAP_TILE_WIDTH
+        tile_height = BITMAP_TILE_HEIGHT
+        if len(img) != self.width * self.height * 3:
+            raise ValueError("RGB frame size does not match negotiated desktop")
+        total_tiles = (((self.width + tile_width - 1) // tile_width) *
+                       ((self.height + tile_height - 1) // tile_height))
         prev = getattr(self, "_last_frame", None)
         perf = getattr(self, "_perf_enabled", False)
         if perf:
             self._perf_last_convert_s = 0.0
             self._perf_last_pdu_s = 0.0
-        if band > 0 and not force and prev is not None and prev == img:
-            # Static pages still need to deliver keyboard and pointer input.
+        if getattr(self, "_rdpgfx_surface_ready", False):
+            if not force and self._rdpgfx_last_frame == img:
+                self._drain_input()
+                self._last_frame = img
+                return 0, total_tiles
+            result = self._paint_rdpgfx(img, total_tiles)
+            if result is not None:
+                self._last_frame = img
+                return result
+        if not force and prev is not None and prev == img:
             self._drain_input()
             self._last_frame = img
-            return 0, (self.height + band - 1) // band
-        sent = skipped = 0
-        for y0 in range(0, self.height, band):
-            if MAX_BANDS and sent >= MAX_BANDS:
-                logging.info("stopping after %d bands (MAX_BANDS)", sent)
+            return 0, total_tiles
+
+        sent = skipped = processed = 0
+        batch = []
+        batch_rects = []
+        batch_bytes = 0
+        surface_batch = []
+        surface_batch_bytes = 0
+
+        def flush_surface_batch():
+            nonlocal sent, surface_batch_bytes
+            if not surface_batch:
+                return
+            packets = fastpath.build_surface_bits_batch(
+                surface_batch, max_packet=BITMAP_UPDATE_CHUNK_BYTES)
+            for packet in packets:
+                self.send(packet, quiet=True)
+            logging.info("surface tile batch sent (%d tiles, %d packets, %d bytes)",
+                         len(surface_batch), len(packets),
+                         sum(map(len, packets)))
+            sent += len(surface_batch)
+            surface_batch.clear()
+            surface_batch_bytes = 0
+            self._drain_input()
+
+        def flush_bitmap_batch():
+            nonlocal sent, batch_bytes
+            if not batch:
+                return
+            updu = bitmap.build_bitmap_update_slow(batch)
+            if len(updu) > 16000:
+                raise ValueError("batched bitmap update exceeds safe TPKT size")
+            self.send_pdu(updu)
+            logging.info("bitmap batch sent (%d rectangles, %d bytes)",
+                         len(batch), len(updu))
+            for left, top, right, bottom, data_size, compressed in batch_rects:
+                logging.debug("bitmap tile (%d,%d)-(%d,%d) sent (%d bytes, compressed=%s)",
+                              left, top, right, bottom, data_size, compressed)
+            sent += len(batch)
+            batch.clear()
+            batch_rects.clear()
+            batch_bytes = 0
+            self._drain_input()
+
+        stop_after_limit = False
+        tile_positions = _tile_origins(
+            self.width, self.height, tile_width, tile_height,
+            center_first=(self._sensitive_page_active and prev is None))
+        for left, top in tile_positions:
+            if MAX_TILES and processed >= MAX_TILES:
+                stop_after_limit = True
                 break
-            y1 = min(y0 + band, self.height)
-            src = img[y0 * self.width * 3: y1 * self.width * 3]
-            if (not force) and prev is not None and \
-                    prev[y0 * self.width * 3: y1 * self.width * 3] == src:
+            processed += 1
+            rect_width = min(tile_width, self.width - left)
+            rect_height = min(tile_height, self.height - top)
+            src = _extract_rgb_region(img, self.width, left, top,
+                                      rect_width, rect_height)
+            if (not force and prev is not None and
+                    _extract_rgb_region(prev, self.width, left, top,
+                                        rect_width, rect_height) == src):
                 skipped += 1
                 continue
-            rows = y1 - y0
+
+            # A new MSTSC bitmap surface starts black. The OTP portal also
+            # uses an exact black surround, so omit only all-black tiles in
+            # its first bitmap frame; subsequent changes still compare
+            # against the full cached frame and are transmitted normally.
+            if (self._sensitive_page_active and prev is None and
+                    not any(src)):
+                skipped += 1
+                continue
+
             if perf:
                 convert_started = time.perf_counter()
-            packed = bitmap.pack_pixels(src, self.width, rows, self.bpp)
+            mode = (BITMAP_COMPRESSION_MODE
+                    if self._sensitive_page_active else "standard")
+            legacy_pixels = legacy_rle = None
+            if (mode == "max" and NSCODEC_SURFACE_UPDATES and
+                    self._nscodec_id is not None and
+                    self._surface_bits_supported):
+                encoded = bitmap.encode_nscodec_rgb(
+                    src, rect_width, rect_height,
+                    self._nscodec_color_loss_level)
+                legacy_pixels = bitmap.pack_pixels(
+                    src, rect_width, rect_height, 16)
+                legacy_rle = bitmap.encode_interleaved_rle(
+                    legacy_pixels, rect_width, rect_height, 16)
+                if len(encoded) < len(legacy_rle):
+                    surface_batch.append({
+                        "left": left, "top": top,
+                        "width": rect_width, "height": rect_height,
+                        "bpp": 32, "codec_id": self._nscodec_id,
+                        "data": encoded,
+                    })
+                    surface_batch_bytes += 25 + len(encoded)
+                    if surface_batch_bytes >= BITMAP_UPDATE_CHUNK_BYTES:
+                        flush_surface_batch()
+                    if BAND_DELAY:
+                        time.sleep(BAND_DELAY)
+                    continue
+
+            # Keep separate batches per codec. Tiles cover disjoint
+            # rectangles, so they can be grouped by codec without changing
+            # the final image; avoiding codec-switch flushes cuts PDU count.
+
+            wire_bpp = 16 if self.bpp <= 16 or mode == "max" else 24
+            if wire_bpp == 16 and legacy_pixels is not None:
+                # NSCodec was considered above. Reuse its 16-bpp fallback
+                # candidates instead of converting and RLE-encoding this
+                # same tile a second time on the CPU.
+                packed = legacy_pixels
+            else:
+                packed = bitmap.pack_pixels(src, rect_width, rect_height,
+                                            wire_bpp)
             if perf:
                 self._perf_last_convert_s += time.perf_counter() - convert_started
-            if len(packed) != stride * rows:
+            wire_stride = (rect_width * (wire_bpp // 8) + 3) & ~3
+            if len(packed) != wire_stride * rect_height:
                 raise ValueError(
-                    "bad packed size %d != %d" % (len(packed), stride * rows)
+                    "bad packed size %d != %d" %
+                    (len(packed), wire_stride * rect_height)
                 )
+            if wire_bpp == 16 and legacy_rle is not None:
+                encoded = legacy_rle
+            else:
+                encoded = (bitmap.encode_interleaved_rle(
+                    packed, rect_width, rect_height, wire_bpp)
+                    if mode != "off" else packed)
+            compressed = mode != "off" and len(encoded) < len(packed)
+            bitmap_data = encoded if compressed else packed
+            bitmap_flags = ((contract.BITMAP_COMPRESSION |
+                             contract.NO_BITMAP_COMPRESSION_HDR)
+                            if compressed else 0)
             rect = {
-                "left": 0,
-                "top": y0,
-                # MS-RDPBCGR 2.2.9.1.1.3.1.2.2: destRight/destBottom are INCLUSIVE
-                "right": self.width - 1,
-                "bottom": y1 - 1,
-                "width": self.width,
-                "height": rows,
-                "bpp": self.bpp,
-                "data": packed,
+                "left": left,
+                "top": top,
+                # MS-RDPBCGR 2.2.9.1.1.3.1.2.2: bounds are inclusive.
+                "right": left + rect_width - 1,
+                "bottom": top + rect_height - 1,
+                "width": rect_width,
+                "height": rect_height,
+                "bpp": wire_bpp,
+                "flags": bitmap_flags,
+                "data": bitmap_data,
             }
             if perf:
                 pdu_started = time.perf_counter()
-            updu = bitmap.build_bitmap_update_slow([rect])
+            tile_wire_size = len(bitmap_data) + 24
+            if batch and batch_bytes + tile_wire_size > BITMAP_UPDATE_CHUNK_BYTES:
+                flush_bitmap_batch()
+            candidate = batch + [rect]
+            updu = bitmap.build_bitmap_update_slow(candidate)
+            if len(updu) > 16000 and batch:
+                flush_bitmap_batch()
+                candidate = [rect]
+                updu = bitmap.build_bitmap_update_slow(candidate)
+            if len(updu) > 16000:
+                raise ValueError("single bitmap tile exceeds safe TPKT size")
             if perf:
                 self._perf_last_pdu_s += time.perf_counter() - pdu_started
-            if sent == 0 and force:
+            if sent == 0 and not batch and force:
                 open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "first_bitmap.bin"), "wb").write(updu)
                 logging.info("dumped first bitmap PDU %d bytes", len(updu))
-            self.send_pdu(updu)
-            sent += 1
-            logging.debug("bitmap band %d..%d sent (%d bytes)", y0, y1, len(packed))
-            self._drain_input()
+            batch.append(rect)
+            batch_bytes += tile_wire_size
+            batch_rects.append((left, top, left + rect_width,
+                                top + rect_height, len(bitmap_data), compressed))
             if BAND_DELAY:
                 time.sleep(BAND_DELAY)
+
+        flush_surface_batch()
+        flush_bitmap_batch()
+        if stop_after_limit:
+            logging.info("stopped after %d tiles (MAX_TILES)", sent)
         self._last_frame = img
         return sent, skipped
 
@@ -1902,8 +2449,8 @@ class RDPConnection:
         self._perf_window_convert_s += getattr(self, "_perf_last_convert_s", 0.0)
         self._perf_window_pdu_s += getattr(self, "_perf_last_pdu_s", 0.0)
         self._perf_window_socket_s += socket_send_s
-        self._perf_window_sent_bands += sent
-        self._perf_window_skipped_bands += skipped
+        self._perf_window_sent_tiles += sent
+        self._perf_window_skipped_tiles += skipped
         elapsed = now - self._perf_window_start
         if elapsed < 2.0:
             return
@@ -1911,14 +2458,14 @@ class RDPConnection:
         divisor = max(frames, 1)
         logging.info(
             "RDP perf fps=%.1f frames=%d capture=%.2fms convert=%.2fms "
-            "pdu=%.2fms socket_send=%.2fms bands_sent=%.1f bands_skipped=%.1f",
+            "pdu=%.2fms socket_send=%.2fms tiles_sent=%.1f tiles_skipped=%.1f",
             frames / elapsed, frames,
             self._perf_window_capture_s * 1000 / divisor,
             self._perf_window_convert_s * 1000 / divisor,
             self._perf_window_pdu_s * 1000 / divisor,
             self._perf_window_socket_s * 1000 / divisor,
-            self._perf_window_sent_bands / divisor,
-            self._perf_window_skipped_bands / divisor,
+            self._perf_window_sent_tiles / divisor,
+            self._perf_window_skipped_tiles / divisor,
         )
         self._perf_window_start = now
         self._perf_window_frames = 0
@@ -1926,8 +2473,8 @@ class RDPConnection:
         self._perf_window_convert_s = 0.0
         self._perf_window_pdu_s = 0.0
         self._perf_window_socket_s = 0.0
-        self._perf_window_sent_bands = 0
-        self._perf_window_skipped_bands = 0
+        self._perf_window_sent_tiles = 0
+        self._perf_window_skipped_tiles = 0
 
     def _pump_input(self, timeout=0.0):
         """Read whatever the client sent, parse it, and dispatch input events.
@@ -1941,7 +2488,7 @@ class RDPConnection:
         (341 bytes / 6 PDUs / 63 events, zero bytes left over).
 
         timeout=0.0 keeps the socket non-blocking so this costs nothing when
-        the client is idle; the old 0.05s block per band made painting ~8s
+        the client is idle; the old 0.05s block per tile made painting ~8s
         slower than it needed to be.
 
         Note settimeout(0.0) == non-blocking (recv raises BlockingIOError
@@ -2017,6 +2564,11 @@ class RDPConnection:
                                     channel_id, parsed.get("user_data") or b"")
                                 del self.inbuf[:tpkt_len]
                                 continue
+                            if channel_id == self._rdpgfx_static_channel_id:
+                                self._handle_drdynvc_data(
+                                    channel_id, parsed.get("user_data") or b"")
+                                del self.inbuf[:tpkt_len]
+                                continue
                         except Exception:
                             logging.exception("rdpsnd TPKT dispatch failed")
                 status, evs, need = fastpath.parse_slowpath(self.inbuf)
@@ -2033,6 +2585,9 @@ class RDPConnection:
                     channel_id = parsed.get("channel_id")
                     if channel_id == self.static_channels.get("rdpsnd"):
                         self._handle_rdpsnd_channel(
+                            channel_id, parsed.get("user_data") or b"")
+                    elif channel_id == self._rdpgfx_static_channel_id:
+                        self._handle_drdynvc_data(
                             channel_id, parsed.get("user_data") or b"")
                 except Exception:
                     logging.exception("static virtual-channel dispatch failed")
@@ -2172,4 +2727,3 @@ def serve(host=None, port=None):
 if __name__ == "__main__":
     import sys
     serve(port=int(sys.argv[1]) if len(sys.argv) > 1 else None)
-

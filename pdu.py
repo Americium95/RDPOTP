@@ -1,7 +1,6 @@
 import struct
 
 from contract import (
-    CAPSTYPE_SURFACE_COMMANDS,
     CAPSTYPE_LARGE_POINTER,
     CAPSTYPE_MULTIFRAGMENTUPDATE,
     CAPSTYPE_BITMAPCACHE_HOSTSUPPORT,
@@ -10,6 +9,8 @@ from contract import (
     CAPSTYPE_INPUT,
     CAPSTYPE_ORDER,
     CAPSTYPE_POINTER,
+    CAPSTYPE_BITMAP_CODECS,
+    CAPSTYPE_SURFACE_COMMANDS,
     CTRLACTION_COOPERATE,
     CTRLACTION_GRANTED_CONTROL,
     ERROR_ALERT,
@@ -183,6 +184,21 @@ def _cap_input() -> bytes:
     return _cap(CAPSTYPE_INPUT, body)
 
 
+def _cap_bitmap_codecs(color_loss_level: int = 3) -> bytes:
+    # NSCodec GUID in the mixed-endian wire representation from MS-RDPBCGR.
+    guid = struct.pack("<IHH8B", 0xCA8D1BB9, 0x000F, 0x154F,
+                       0x58, 0x9F, 0xAE, 0x2D, 0x1A, 0x87, 0xE2, 0xD6)
+    # This encoder uses CLL but does not yet implement chroma subsampling.
+    props = bytes((0, 0, color_loss_level))
+    codec = guid + b"\x01" + struct.pack("<H", len(props)) + props
+    return _cap(CAPSTYPE_BITMAP_CODECS, b"\x01" + codec)
+
+
+def _cap_surface_commands() -> bytes:
+    # Advertise Set Surface Bits support, including the required reserved field.
+    return _cap(CAPSTYPE_SURFACE_COMMANDS, struct.pack("<II", 0x00000002, 0))
+
+
 def build_demand_active(width: int, height: int, bpp: int = 32) -> bytes:
     cap_list = [
         _cap_general(),
@@ -190,6 +206,8 @@ def build_demand_active(width: int, height: int, bpp: int = 32) -> bytes:
         _cap_order(),
         _cap_pointer(),
         _cap_input(),
+        _cap_bitmap_codecs(),
+        _cap_surface_commands(),
     ]
     caps = b"".join(cap_list)
     num_caps = len(cap_list)
@@ -223,8 +241,12 @@ def parse_confirm_active(user_data: bytes) -> dict:
       .. numberCapabilities (2), pad2Octets (2), capabilitySets, sessionId(4)
     """
     width = height = bpp = 0
+    nscodec_id = nscodec_color_loss_level = None
+    surface_command_flags = 0
     if len(user_data) < 20:
-        return {"desktop_width": width, "desktop_height": height, "bpp": bpp}
+        return {"desktop_width": width, "desktop_height": height, "bpp": bpp,
+                "nscodec_id": None, "nscodec_color_loss_level": None,
+                "surface_command_flags": 0}
     lsd = struct.unpack_from("<H", user_data, 12)[0]
     lcc = struct.unpack_from("<H", user_data, 14)[0]
     offset = 16 + lsd + 4
@@ -233,14 +255,38 @@ def parse_confirm_active(user_data: bytes) -> dict:
         cap_type, cap_length = struct.unpack_from("<HH", user_data, offset)
         if cap_length < 4:
             break
+        if cap_type == CAPSTYPE_BITMAP_CODECS and cap_length >= 5:
+            codec_count = user_data[offset + 4]
+            codec_offset = offset + 5
+            cap_end = min(offset + cap_length, len(user_data))
+            nscodec_guid = struct.pack("<IHH8B", 0xCA8D1BB9, 0x000F, 0x154F,
+                                       0x58, 0x9F, 0xAE, 0x2D, 0x1A, 0x87, 0xE2, 0xD6)
+            for _ in range(codec_count):
+                if codec_offset + 19 > cap_end:
+                    break
+                guid = user_data[codec_offset:codec_offset + 16]
+                codec_id = user_data[codec_offset + 16]
+                prop_len = struct.unpack_from("<H", user_data, codec_offset + 17)[0]
+                prop_start = codec_offset + 19
+                prop_end = prop_start + prop_len
+                if prop_end > cap_end:
+                    break
+                if guid == nscodec_guid and prop_len >= 3:
+                    nscodec_id = codec_id
+                    nscodec_color_loss_level = user_data[prop_start + 2]
+                codec_offset = prop_end
+        if cap_type == CAPSTYPE_SURFACE_COMMANDS and cap_length >= 8:
+            surface_command_flags = struct.unpack_from("<I", user_data, offset + 4)[0]
         # TS_BITMAP_CAPABILITYSET: type(0) len(2) bpp(4) r1(6) r4(8) r8(10) w(12) h(14)
         if cap_type == CAPSTYPE_BITMAP and cap_length >= 16 and offset + 16 <= len(user_data):
             bpp = struct.unpack_from("<H", user_data, offset + 4)[0]
             width = struct.unpack_from("<H", user_data, offset + 12)[0]
             height = struct.unpack_from("<H", user_data, offset + 14)[0]
-            break
         offset += cap_length
-    return {"desktop_width": width, "desktop_height": height, "bpp": bpp}
+    return {"desktop_width": width, "desktop_height": height, "bpp": bpp,
+            "nscodec_id": nscodec_id,
+            "nscodec_color_loss_level": nscodec_color_loss_level,
+            "surface_command_flags": surface_command_flags}
 
 
 def classify_user_data(user_data: bytes) -> dict:

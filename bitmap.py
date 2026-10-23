@@ -140,6 +140,129 @@ def pack_pixels(pixels: bytes, width: int, height: int, bpp: int) -> bytes:
     raise ValueError("unsupported bpp: %d" % (bpp,))
 
 
+def encode_interleaved_rle(packed: bytes, width: int, height: int,
+                           bpp: int) -> bytes:
+    """Encode a bottom-up bitmap with MS-RDPBCGR Interleaved RLE orders.
+
+    Emits only COLOR_RUN (0x03) and COLOR_IMAGE (0x04), both standard
+    compression orders. Row alignment bytes from the uncompressed bitmap are
+    omitted from the compressed stream as required by the pixel stream.
+    """
+    if bpp not in (16, 24):
+        raise ValueError("Interleaved RLE supports 16/24 bpp, got %d" % bpp)
+    bytes_per_pixel = bpp // 8
+    stride = (width * bytes_per_pixel + 3) & ~3
+    if len(packed) != stride * height:
+        raise ValueError("bad bitmap size for RLE")
+    pixels = b"".join(
+        packed[y * stride:y * stride + width * bytes_per_pixel]
+        for y in range(height)
+    )
+    pixel_count = width * height
+    out = bytearray()
+    pos = 0
+
+    def emit_header(code, count):
+        # Standard orders encode 1..31 in the low five bits. A zero low field
+        # is followed by an unsigned extension representing count - 32.
+        if not 1 <= count <= 287:
+            raise ValueError("RLE order run out of range")
+        out.append((code << 5) | (count if count <= 31 else 0))
+        if count > 31:
+            out.append(count - 32)
+
+    while pos < pixel_count:
+        pixel_at = pos * bytes_per_pixel
+        pixel = pixels[pixel_at:pixel_at + bytes_per_pixel]
+        run = 1
+        while pos + run < pixel_count and run < 287:
+            at = (pos + run) * bytes_per_pixel
+            if pixels[at:at + bytes_per_pixel] != pixel:
+                break
+            run += 1
+        if run >= 2:
+            emit_header(0x03, run)  # REGULAR_COLOR_RUN
+            out.extend(pixel)
+            pos += run
+            continue
+
+        # Gather a literal span, stopping before a repeated-color run.
+        start = pos
+        pos += 1
+        while pos < pixel_count and pos - start < 287:
+            at = pos * bytes_per_pixel
+            next_pixel = pixels[at:at + bytes_per_pixel]
+            next_run = 1
+            while pos + next_run < pixel_count and next_run < 2:
+                nxt = (pos + next_run) * bytes_per_pixel
+                if pixels[nxt:nxt + bytes_per_pixel] != next_pixel:
+                    break
+                next_run += 1
+            if next_run >= 2:
+                break
+            pos += 1
+        count = pos - start
+        emit_header(0x04, count)  # REGULAR_COLOR_IMAGE
+        begin = start * bytes_per_pixel
+        end = pos * bytes_per_pixel
+        out.extend(pixels[begin:end])
+    return bytes(out)
+
+
+def encode_nscodec_rgb(pixels: bytes, width: int, height: int,
+                       color_loss_level: int = 3) -> bytes:
+    """Encode top-down RGB pixels as an MS-RDPNSC frame (no chroma subsampling)."""
+    if not 1 <= color_loss_level <= 7:
+        raise ValueError("NSCodec color loss level must be 1..7")
+    if len(pixels) != width * height * 3:
+        raise ValueError("bad RGB buffer size for NSCodec")
+    planes = [bytearray(), bytearray(), bytearray(), bytearray()]
+    shift = color_loss_level
+    for y in range(height - 1, -1, -1):
+        row = y * width * 3
+        for x in range(width):
+            i = row + x * 3
+            r, g, b = pixels[i], pixels[i + 1], pixels[i + 2]
+            planes[0].append((r >> 2) + (g >> 1) + (b >> 2))
+            co = max(-128, min(127, (r - b) >> shift))
+            cg = max(-128, min(127, (-(r >> 1) + g - (b >> 1)) >> shift))
+            planes[1].append(co & 0xFF)
+            planes[2].append(cg & 0xFF)
+            planes[3].append(0xFF)
+
+    def rle(plane):
+        n = len(plane)
+        if n <= 4:
+            return bytes(plane)
+        end = n - 4
+        out = bytearray()
+        i = 0
+        while i < end:
+            value = plane[i]
+            run = 1
+            while i + run < end and plane[i + run] == value:
+                run += 1
+            if run == 1:
+                out.append(value)
+            elif run <= 255:
+                out.extend((value, value, run - 2))
+            else:
+                out.extend((value, value, 0xFF))
+                out.extend(struct.pack("<I", run))
+            i += run
+        out.extend(plane[end:])
+        # NSCodec signals an uncompressed plane by giving it its original
+        # pixel count.  A larger RLE stream is not a valid substitute: clients
+        # still try to decode it as runs and can lose the containing tile.
+        # Match the interoperable encoder behavior and keep raw data unless
+        # RLE strictly reduces the plane size.
+        return bytes(out) if len(out) < n else bytes(plane)
+
+    encoded = [rle(p) for p in planes]
+    return (b"".join(struct.pack("<I", len(p)) for p in encoded) +
+            bytes((color_loss_level, 0, 0, 0)) + b"".join(encoded))
+
+
 def make_test_image(width: int, height: int) -> bytes:
     buf = bytearray(width * height * 3)
     wx = max(width - 1, 1)

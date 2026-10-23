@@ -164,10 +164,8 @@ class Browser:
     def _wait_ready(self, timeout):
         deadline = time.time() + timeout
         last = None
+        exited_at = None
         while time.time() < deadline:
-            if self.proc.poll() is not None:
-                raise CDPError("chrome exited immediately (code %s)"
-                               % self.proc.returncode)
             try:
                 if self.port == 0:
                     with open(os.path.join(self.profile, "DevToolsActivePort"),
@@ -177,7 +175,21 @@ class Browser:
                 return
             except Exception as exc:               # not up yet
                 last = exc
-                time.sleep(0.15)
+            # On Windows, the launcher process can exit successfully after
+            # handing startup to Chrome's browser process.  Give the CDP
+            # endpoint a short grace period instead of treating that handoff
+            # as a failed launch.  The unique profile directory means a stale
+            # DevToolsActivePort file cannot belong to another session.
+            if self.proc.poll() is not None:
+                if exited_at is None:
+                    exited_at = time.monotonic()
+                elif time.monotonic() - exited_at >= 3.0:
+                    raise CDPError("chrome launcher exited (code %s) before "
+                                   "debugging port became ready: %s"
+                                   % (self.proc.returncode, last))
+            else:
+                exited_at = None
+            time.sleep(0.15)
         raise CDPError("chrome debugging port never came up: %s" % last)
 
     def _json(self, url):
@@ -410,7 +422,7 @@ class Browser:
         jpg = base64.b64decode(res["data"])
         w, h, rgb = render.decode_png_bytes(jpg)
         if (w, h) != (self.width, self.height):
-            rgb = render._fit(rgb, w, h, self.width, self.height)
+            rgb = render.resize_rgb(rgb, w, h, self.width, self.height)
         return self.width, self.height, rgb
 
     # ---------- screencast ----------
@@ -418,7 +430,10 @@ class Browser:
     # events instead of us paying for a Page.captureScreenshot round trip per
     # frame.  That is what makes live video over RDP possible at all: a
     # screenshot costs ~1.2s, a screencast frame costs one websocket read.
-    def start_screencast(self, quality=60, every_nth=1, scale=1.0):
+    def start_screencast(self, quality=60, every_nth=1, scale=1.0,
+                         format="jpeg"):
+        if format not in ("jpeg", "png"):
+            raise ValueError("screencast format must be 'jpeg' or 'png'")
         self._frame_rgb = None
         self._frame_seq = 0
         # The browser is a process-wide singleton, so a previous RDP session can
@@ -431,18 +446,19 @@ class Browser:
             except CDPError:
                 pass
             self._screencasting = False
-        # JPEG over websocket is smaller; PyAV with NVENC decodes it on GPU.
+        # JPEG remains the default for smaller websocket frames; PNG is lossless.
         mw = max(64, int(self.width * scale))
         mh = max(64, int(self.height * scale))
         params = {
-            "format": "jpeg",
-            "quality": quality,
+            "format": format,
             "maxWidth": mw,
             "maxHeight": mh,
             "everyNthFrame": every_nth,
             "maxFramesInFlight": 5,
             "sendLastFrame": True,
         }
+        if format == "jpeg":
+            params["quality"] = quality
         deadline = time.monotonic() + 5.0
         while True:
             try:
@@ -453,8 +469,9 @@ class Browser:
                     raise
                 time.sleep(0.2)
         self._screencasting = True
-        logging.info("screencast started (jpeg q=%d, %dx%d, everyNth=%d)",
-                     quality, mw, mh, every_nth)
+        logging.info("screencast started (%s%s, %dx%d, everyNth=%d)",
+                     format, " q=%d" % quality if format == "jpeg" else "",
+                     mw, mh, every_nth)
 
     def stop_screencast(self):
         if self._screencasting:
@@ -472,7 +489,7 @@ class Browser:
         Reading happens on the dedicated reader thread, so this just drains
         the queue -- no socket timeouts, no desynchronisation.
 
-        JPEG frames are decoded via PyAV (NVENC GPU) for speed.
+        JPEG frames use PyAV; PNG frames use the lossless PNG decoder.
         """
         newest = None
         deadline = time.time() + max(0.0, budget)
@@ -499,13 +516,15 @@ class Browser:
                 if not data:
                     continue
                 try:
-                    # data is base64 JPEG; decode via PyAV (NVENC GPU)
-                    jpg = base64.b64decode(data)
-                    w, h, rgb = _decode_jpeg_nvenc(jpg)
+                    frame_data = base64.b64decode(data)
+                    if frame_data.startswith(b"\x89PNG\r\n\x1a\n"):
+                        w, h, rgb = render.decode_png_bytes(frame_data)
+                    else:
+                        w, h, rgb = _decode_jpeg_nvenc(frame_data)
                 except Exception:
                     continue
                 if (w, h) != (self.width, self.height):
-                    rgb = render._fit(rgb, w, h, self.width, self.height)
+                    rgb = render.resize_rgb(rgb, w, h, self.width, self.height)
                 newest = rgb
                 self._frame_seq += 1
         if newest is not None:

@@ -6,13 +6,13 @@ RDPOTP is a Windows Remote Desktop gateway that adds a one-time passcode check b
 
 ![RDPOTP one-time-passcode screen](assets/rdpotp-otp-screen.png)
 
-The screenshot is an example session. Its title bar shows port `4983`; the default gateway port in the current `config.ini` is `3390`.
+The screenshot is an example session. Its title bar shows port `4983`; the default gateway port in the current `config.ini` is `3091`.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    C[Remote Desktop client<br/>MSTSC or phone app] -->|RDP to gateway :3390| G[RDPOTP gateway<br/>server.py]
+    C[Remote Desktop client<br/>MSTSC or phone app] -->|RDP to gateway :3091| G[RDPOTP gateway<br/>server.py]
     G -->|OTP page and input events| B[Local Chrome or Edge<br/>portal rendering]
     G -->|Four-digit OTP| N[send_notify.bat<br/>configured notification URL]
     C -->|Code entry| G
@@ -59,10 +59,15 @@ Replace the example topic with your own hard-to-guess topic. Notifications conta
 | Setting | Default | Description |
 | --- | --- | --- |
 | `[server] host` | `0.0.0.0` | Interfaces on which the gateway listens. Firewall rules still control access. |
-| `[server] port` | `3390` | Port that RDP clients use to reach the gateway. |
+| `[server] port` | `3091` | Port that RDP clients use to reach the gateway. |
 | `[server] native_host` | `127.0.0.1` | Address of the PC's built-in RDP service. |
 | `[server] native_port` | `3389` | Port of the built-in RDP service. |
-| `[server] max_fps` | `30` | Maximum screen updates per second. Set to `0` for no configured cap. |
+| `[server] max_fps` | `10` | Maximum screen updates per second. Set to `0` for no configured cap. |
+| `[server] render_scale` | `1.0` | Internal OTP browser capture scale (`0.25` to `1.0`). The default captures at the full negotiated RDP canvas size. Lower values reduce detail and capture work but do not guarantee lower encoded network traffic. |
+| `[server] bitmap_chunk_bytes` | `4096` | Target maximum encoded bitmap update size in bytes. Smaller batches help clients on slow links. |
+| `[server] bitmap_compression` | `max` | OTP portal mode: `max` (16-bpp RGB565 + RLE), `standard`/`on` (24-bpp + RLE), or `off` (24-bpp uncompressed). |
+| `[server] nscodec_surface_updates` | `false` | Enables NSCodec Surface Bits for the OTP portal. Keep disabled for reliable MSTSC tile rendering. |
+| `[server] graphics_codec` | `auto` | `auto` uses AVC420 only after client GFX, DRDYNVC, and RDPGFX capability negotiation succeeds; `h264` requests that same gated path; `bitmap` disables GFX and keeps bitmap updates. Unsupported clients and failed negotiation fall back to bitmap updates. |
 | `[server] band_delay` | `0` | Optional delay in seconds between screen bitmap bands. |
 | `[server] redirect_drain_seconds` | `15` | Maximum time the gateway waits for the client to close after redirection. |
 | `[server] disable_hybrid_ex` | `false` | Disables the Hybrid-Ex RDP negotiation path when set to `true`. Normally leave unchanged. |
@@ -76,6 +81,27 @@ Replace the example topic with your own hard-to-guess topic. Notifications conta
 | `[notify] url` | empty | Private notification destination used by `send_notify.bat`. |
 
 Supported environment variables override their matching `config.ini` values. Examples include `RDP_PORT`, `RDP_OTP_TTL_SECONDS`, and `RDP_NOTIFY_URL`.
+
+The OTP portal defaults to 16-bpp RGB565 output and standard RDP bitmap RLE,
+falling back to an uncompressed bitmap when RLE would be larger. This keeps the
+requested resolution and reduces portal color precision. Set
+`bitmap_compression = standard` for sharper portal colors, or `off` to disable
+portal RLE. After the OTP handoff, the native Windows RDP connection negotiates
+display settings with the client; this portal-only setting does not change the
+PC desktop's RDP configuration.
+`nscodec_surface_updates = false` keeps the tested legacy bitmap path; enabling
+it opts into the NSCodec Surface Bits path, which can leave missing tiles in
+MSTSC. `graphics_codec = auto` keeps the bitmap path unless the
+client advertises Graphics Pipeline support, joins `drdynvc`, and confirms an
+AVC420-capable RDPGFX capability set. Set it to `bitmap` to force the legacy
+graphics path. `h264` still requires every client capability check and falls
+back to bitmap updates when any check fails.
+For a slower link, set `[server] max_fps = 5` to limit portal updates. Leave
+`band_delay = 0`.
+The default `[server] render_scale = 1.0` captures at the negotiated desktop
+size. Lower values reduce capture work but still produce the same RDP canvas;
+encoded network traffic depends on image content and codec compression. Smaller
+`bitmap_chunk_bytes` values can reduce per-packet stalls on very slow links.
 
 ## Start the gateway
 
@@ -93,10 +119,10 @@ Supported environment variables override their matching `config.ini` values. Exa
 On the same PC, open Remote Desktop Connection (`mstsc`) and connect to:
 
 ```text
-127.0.0.1:3390
+127.0.0.1:3091
 ```
 
-For a device on the same LAN, connect to the PC's LAN address and configured gateway port, for example `192.168.1.20:3390`. Use the actual address assigned to the PC. Allow inbound TCP traffic on the gateway port in Windows Firewall only for the network profile and client devices that need access. Do not expose the gateway directly to the public internet.
+For a device on the same LAN, connect to the PC's LAN address and configured gateway port, for example `192.168.1.20:3091`. Use the actual address assigned to the PC. Allow inbound TCP traffic on the gateway port in Windows Firewall only for the network profile and client devices that need access. Do not expose the gateway directly to the public internet.
 
 The gateway sends an initial OTP when the page opens. If needed, select **Resend**; resend requests are rate limited. Enter the code and select **Submit** before the countdown expires. After a valid code, the RDP client is redirected to the native Windows service and prompts for normal Windows credentials. If you change the gateway port, use the new port in both the client address and firewall rule.
 
@@ -122,7 +148,7 @@ Close the existing RDPOTP server or change `[server] port` in `config.ini`. Conn
 
 ### MSTSC cannot connect
 
-Confirm the server command window is still running, MSTSC uses the configured gateway port (default `3390`), and Windows Firewall allows that TCP port from the client device. For LAN connections, use the PC's LAN address rather than `127.0.0.1`.
+Confirm the server command window is still running, MSTSC uses the configured gateway port (default `3091`), and Windows Firewall allows that TCP port from the client device. For LAN connections, use the PC's LAN address rather than `127.0.0.1`.
 
 ### No OTP notification arrives
 
