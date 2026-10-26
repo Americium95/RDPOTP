@@ -158,6 +158,34 @@ Confirm `[notify] url` contains the correct private endpoint and the PC can reac
 
 The OTP only authorizes the handoff; Windows still performs its normal Remote Desktop authentication. Confirm that Remote Desktop is enabled, the native service is listening at `[server] native_host` and `[server] native_port`, and the account is allowed to sign in through Remote Desktop.
 
+## FAQ
+
+### What is RDPOTP?
+RDPOTP is a free, open-source, self-hosted OTP (one-time password) gateway for
+Windows Remote Desktop (RDP / MSTSC). It adds a disposable 4-digit passcode check
+before handing the RDP client off to the PC's built-in Remote Desktop service,
+acting as a lightweight two-factor authentication (2FA) layer in front of Windows
+RDP. Windows still enforces its normal account and password authentication after
+the handoff.
+
+### How do I add 2FA / OTP to Windows Remote Desktop?
+Install RDPOTP on the Windows PC, set a private notification URL in `config.ini`,
+run `run.bat`, and point your RDP client at the gateway port (default `3091`).
+Each connection must enter a fresh 4-digit code before reaching the native
+Windows RDP service.
+
+### Does RDPOTP replace Windows authentication?
+No. RDPOTP adds an extra gateway check; Windows still performs its normal
+Remote Desktop authentication (account + password / NLA) on the native service.
+
+### Is RDPOTP free and open source?
+Yes. RDPOTP is released under the MIT license and runs entirely on your own
+Windows PC with no cloud dependency.
+
+### Can I use RDPOTP from my phone or another PC?
+Yes. Any standard RDP client (MSTSC, Microsoft Remote Desktop mobile app,
+FreeRDP, etc.) can connect to the gateway address and port.
+
 ## Runtime data and privacy
 
 `server.log` contains runtime diagnostics. `client_viewports.json` stores viewport dimensions associated with client addresses. These are local runtime files and are excluded by `.gitignore`. Do not commit runtime logs, client address data, generated certificates, private keys, real notification URLs, or saved `.rdp` profiles.
