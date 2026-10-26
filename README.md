@@ -1,10 +1,16 @@
-# RDPOTP
+# RDPOTP — RDP OTP Gateway for Windows Remote Desktop
 
-RDPOTP is a Windows Remote Desktop gateway that adds a one-time passcode check before handing a client off to the PC's built-in Remote Desktop service. The OTP is an extra gateway check; Windows still asks for a permitted Windows account and its normal credentials after the handoff.
+**RDP OTP** (one-time password) for Windows Remote Desktop. RDPOTP is a free,
+open-source, self-hosted RDP OTP gateway that adds a one-time passcode check
+before handing a client off to the PC's built-in Remote Desktop service. It works
+as a lightweight two-factor authentication (2FA) layer for RDP / MSTSC: each
+connection must enter a fresh 4-digit code before reaching Windows. Windows still
+asks for a permitted Windows account and its normal credentials after the
+handoff.
 
 ## OTP screen
 
-![RDPOTP one-time-passcode screen](assets/rdpotp-otp-screen.png)
+![RDPOTP RDP OTP one-time passcode screen](assets/rdpotp-otp-screen.png)
 
 The screenshot is an example session. Its title bar shows port `4983`; the default gateway port in the current `config.ini` is `3091`.
 
@@ -185,6 +191,14 @@ Windows PC with no cloud dependency.
 ### Can I use RDPOTP from my phone or another PC?
 Yes. Any standard RDP client (MSTSC, Microsoft Remote Desktop mobile app,
 FreeRDP, etc.) can connect to the gateway address and port.
+
+## Keywords
+
+RDP OTP, RDP one-time password, Remote Desktop OTP, OTP for RDP, RDP 2FA,
+two-factor authentication for Remote Desktop, Windows Remote Desktop OTP gateway,
+RDP brute force protection, self-hosted RDP gateway, MSTSC OTP, RDP one-time
+passcode, secure Remote Desktop, RDP authentication, RDP security, RDP gateway
+Python, Windows RDP OTP.
 
 ## Runtime data and privacy
 
